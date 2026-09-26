@@ -4,6 +4,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import inspect
 
+import requests
+
 import bot
 from db import get_group, init_db, open_db
 
@@ -46,6 +48,7 @@ def test_only_group_mention_or_reply(monkeypatch):
                  if reply_to is not None else None)
         return SimpleNamespace(text=text, reply_to_message=reply)
     assert bot.is_addressed(message("@Tg2HtmlBot общая статистика"))
+    assert bot.is_addressed(message("@Tg2HtmlBot"))
     assert bot.is_addressed(message("сколько стартов?", reply_to=12))
     assert not bot.is_addressed(message("сколько стартов?"))
     assert not bot.is_addressed(message("сколько стартов?", reply_to=99))
@@ -53,6 +56,62 @@ def test_only_group_mention_or_reply(monkeypatch):
     assert not bot.is_addressed(message("/stats@Tg2HtmlBot общая статистика"))
     assert not bot.is_addressed(message("/stats@AnotherBot статистика"))
     assert not bot.is_addressed(message("/stats общая статистика"))
+
+
+def test_bare_mention_gets_help_reply(monkeypatch):
+    monkeypatch.setattr(bot, "identity", SimpleNamespace(username="Tg2HtmlBot", id=12))
+    replies = []
+
+    def fake_reply(message, text, **kwargs):
+        replies.append(text)
+        return SimpleNamespace(message_id=1)
+
+    with TemporaryDirectory() as folder:
+        db_path = str(Path(folder) / "bot.sqlite3")
+        monkeypatch.setattr(bot, "DATABASE", db_path)
+        with closing(open_db(db_path)) as conn:
+            init_db(conn)
+            from db import bind_group
+            bind_group(conn, -100, "Group", None, "5", "Buyer")
+        monkeypatch.setattr(bot.bot, "reply_to", fake_reply)
+        message = SimpleNamespace(
+            text="@Tg2HtmlBot",
+            chat=SimpleNamespace(id=-100, type="supergroup"),
+            from_user=SimpleNamespace(id=7),
+            message_id=50,
+            reply_to_message=None,
+        )
+        bot.group_question(message)
+    assert replies == [bot.EMPTY_MENTION_REPLY]
+
+
+def test_tg_call_retries_connection_errors(monkeypatch):
+    monkeypatch.setattr(bot.time, "sleep", lambda *_: None)
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise requests.exceptions.ConnectionError("reset")
+        return "ok"
+
+    assert bot.tg_call(flaky, attempts=3, delay=0.01) == "ok"
+    assert calls["n"] == 3
+
+
+def test_tg_call_does_not_retry_logic_errors():
+    calls = {"n": 0}
+
+    def boom():
+        calls["n"] += 1
+        raise ValueError("bad")
+
+    try:
+        bot.tg_call(boom, attempts=3, delay=0.01)
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+    assert calls["n"] == 1
 
 
 def test_group_handler_does_not_send_typing():

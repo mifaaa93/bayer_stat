@@ -15,6 +15,7 @@ ADMIN_IDS=123456789
 OPENAI_API_KEY=
 OPENAI_BASE_URL=https://ru.cheapvibecode.ru/v1
 OPENAI_MODEL=gpt-5.6-sol
+OPENAI_REASONING_EFFORT=medium
 DATABASE_PATH=data/bot.sqlite3
 LOG_PATH=data/bot.log
 LOG_LEVEL=INFO
@@ -34,6 +35,10 @@ MYSQL_DATABASE=
 Логи пишутся в stderr и в файл `LOG_PATH` (по умолчанию рядом с SQLite:
 `data/bot.log`, ротация по 5 МБ × 5 файлов). Для более подробной отладки
 поставьте `LOG_LEVEL=DEBUG`.
+
+`OPENAI_REASONING_EFFORT` передаётся в API как `reasoning_effort`
+(`minimal` / `low` / `medium` / `high`). Пустое значение — параметр не
+отправляется.
 
 Бот читает схему нужных таблиц через `information_schema` при первом запросе.
 Предполагаемые поля: `creos` — `date`, `creo_name`, `budget`, `id_traf`;

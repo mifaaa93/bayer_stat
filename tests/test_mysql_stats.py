@@ -4,7 +4,9 @@ from unittest.mock import Mock, patch
 import pytest
 
 import mysql_stats
-from ai_analysis import Analyst, TOOL_PROGRESS, TOOLS, parse_date, summarize
+from ai_analysis import (
+    CLARIFY_QUESTION, Analyst, TOOL_PROGRESS, TOOLS, parse_date, summarize,
+)
 
 
 class Cursor:
@@ -265,10 +267,11 @@ def test_tool_statuses_are_user_friendly(tool_name, expected):
     statuses = []
     with patch.object(analyst, "_request", side_effect=[first, second]):
         with patch.object(analyst, "call_tool", return_value={"has_data": True}):
-            _, called = analyst._run_tools(
+            _, has_data, tools_used, direct = analyst._run_tools(
                 analyst._messages("данные за сегодня"), statuses.append
             )
-    assert called
+    assert has_data and tools_used
+    assert direct == "Готово"
     assert expected in statuses
     assert all("MySQL" not in status and "tool" not in status.casefold()
                for status in statuses)
@@ -288,7 +291,48 @@ def test_tool_round_limit_returns_collected_data_without_raising():
     }
     with patch.object(analyst, "_request", return_value=keep_calling) as request:
         with patch.object(analyst, "call_tool", return_value={"has_data": True}):
-            messages, called = analyst._run_tools(analyst._messages("данные"))
-    assert called
+            messages, has_data, tools_used, direct = analyst._run_tools(
+                analyst._messages("данные")
+            )
+    assert has_data and tools_used
+    assert direct == ""
     assert request.call_count == 20
     assert sum(1 for item in messages if item.get("role") == "tool") == 20
+
+
+def test_vague_question_without_tools_asks_to_clarify():
+    analyst = Analyst("5", "Buyer", "key", "model", "https://example.test/v1")
+    response = Mock()
+    response.json.return_value = {
+        "choices": [{"message": {
+            "content": "Уточните, пожалуйста, период и метрики.",
+            "tool_calls": [],
+        }}]
+    }
+    with patch.object(analyst, "_request", return_value=response):
+        answer = analyst.answer_stream("тест")
+    assert "период" in answer.casefold()
+    assert "Не удалось получить данные" not in answer
+
+
+def test_vague_question_empty_model_reply_uses_fallback_clarify():
+    analyst = Analyst("5", "Buyer", "key", "model", "https://example.test/v1")
+    response = Mock()
+    response.json.return_value = {
+        "choices": [{"message": {"content": None, "tool_calls": []}}]
+    }
+    with patch.object(analyst, "_request", return_value=response):
+        assert analyst.answer_stream("тест") == CLARIFY_QUESTION
+
+
+def test_reasoning_effort_is_sent_in_payload():
+    analyst = Analyst(
+        "5", "Buyer", "key", "model", "https://example.test/v1",
+        reasoning_effort="medium",
+    )
+    response = Mock()
+    response.status_code = 200
+    with patch("ai_analysis.requests.post", return_value=response) as post:
+        analyst._request([{"role": "user", "content": "hi"}], tools=False)
+    payload = post.call_args.kwargs["json"]
+    assert payload["reasoning_effort"] == "medium"

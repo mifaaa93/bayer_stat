@@ -10,9 +10,12 @@ import re
 import threading
 import time
 from contextlib import closing
+from typing import Callable, TypeVar
 
+import requests
 import telebot
 from telebot import types
+from telebot.apihelper import ApiTelegramException
 
 import mysql_stats
 from ai_analysis import Analyst
@@ -20,7 +23,7 @@ from db import (
     bind_group, clear_chat_history, count_groups, get_group, init_db,
     list_groups, load_chat_history, open_db, remove_group, save_chat_turn,
 )
-from settings import DATABASE, configure_logging, admin_ids
+from settings import DATABASE, REASONING_EFFORT, configure_logging, admin_ids
 
 
 configure_logging()
@@ -31,6 +34,49 @@ pending: dict[int, dict] = {}
 state_lock = threading.RLock()
 chat_locks: dict[int, threading.Lock] = {}
 identity = None
+EMPTY_MENTION_REPLY = (
+    "Чем могу помочь? Напишите период и что нужно: "
+    "сводка, воронка, креатив или сравнение."
+)
+T = TypeVar("T")
+_TG_TRANSIENT = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    BrokenPipeError,
+    TimeoutError,
+)
+
+
+def _transient_telegram(exc: BaseException) -> bool:
+    if isinstance(exc, _TG_TRANSIENT):
+        return True
+    if isinstance(exc, ApiTelegramException):
+        code = getattr(exc, "error_code", None)
+        return code in {429, 500, 502, 503, 504}
+    cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+    return isinstance(cause, _TG_TRANSIENT)
+
+
+def tg_call(action: Callable[..., T], *args, attempts: int = 3,
+            delay: float = 0.8, **kwargs) -> T:
+    """Retry Telegram API calls on short network / gateway failures."""
+    last: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return action(*args, **kwargs)
+        except Exception as exc:
+            last = exc
+            if not _transient_telegram(exc) or attempt == attempts:
+                raise
+            log.warning(
+                "Telegram call retry attempt=%s/%s action=%s error=%s",
+                attempt, attempts, getattr(action, "__name__", action), exc,
+            )
+            time.sleep(delay * attempt)
+    assert last is not None
+    raise last
 
 
 def admin_private(message) -> bool:
@@ -385,7 +431,7 @@ def group_question(message):
     lock = chat_locks.setdefault(message.chat.id, threading.Lock())
     if not lock.acquire(blocking=False):
         log.info("Group query busy chat_id=%s user_id=%s", message.chat.id, user_id)
-        bot.reply_to(message, "Ещё обрабатываю предыдущий вопрос. Подождите.")
+        tg_call(bot.reply_to, message, "Ещё обрабатываю предыдущий вопрос. Подождите.")
         return
     status = None
     answer = None
@@ -399,17 +445,20 @@ def group_question(message):
         )
         question = question.strip()
         if not question:
-            log.info("Empty question after mention strip chat_id=%s", message.chat.id)
+            log.info("Empty mention chat_id=%s user_id=%s", message.chat.id, user_id)
+            tg_call(bot.reply_to, message, EMPTY_MENTION_REPLY)
             return
         log.info(
             "Processing question chat_id=%s buyer_id=%s buyer=%s history=%s question=%r",
             message.chat.id, group["buyer_id"], group["buyer_name"],
             len(history), " ".join(question.split())[:200],
         )
-        status = bot.reply_to(message, "Анализирую вопрос…")
+        status = tg_call(bot.reply_to, message, "Анализирую вопрос…")
         analyst = Analyst(
             group["buyer_id"], group["buyer_name"], os.environ["OPENAI_API_KEY"],
-            os.environ["OPENAI_MODEL"], os.getenv("OPENAI_BASE_URL", "https://ru.cheapvibecode.ru/v1"),
+            os.environ["OPENAI_MODEL"],
+            os.getenv("OPENAI_BASE_URL", "https://ru.cheapvibecode.ru/v1"),
+            reasoning_effort=REASONING_EFFORT,
         )
         last_update = 0.0
         current_status = ""
@@ -428,7 +477,10 @@ def group_question(message):
                 if text == current_status or (not force and now-last_update < 1.2):
                     return
                 try:
-                    bot.edit_message_text(text, message.chat.id, status.message_id)
+                    tg_call(
+                        bot.edit_message_text, text, message.chat.id,
+                        status.message_id, attempts=2, delay=0.4,
+                    )
                     current_status, last_update = text, now
                 except Exception:
                     log.debug("Progress update failed", exc_info=True)
@@ -456,7 +508,8 @@ def group_question(message):
                                        on_status=on_status, history=history)
         done.set()
         try:
-            bot.send_rich_message(
+            tg_call(
+                bot.send_rich_message,
                 message.chat.id, types.InputRichMessage(markdown=answer),
                 reply_parameters=types.ReplyParameters(message_id=message.message_id),
             )
@@ -464,7 +517,7 @@ def group_question(message):
         except Exception:
             log.warning("Rich message failed; plain reply chat_id=%s", message.chat.id,
                         exc_info=True)
-            bot.reply_to(message, answer, parse_mode=None)
+            tg_call(bot.reply_to, message, answer, parse_mode=None)
         with closing(open_db(DATABASE)) as conn:
             save_chat_turn(conn, message.chat.id, question, answer)
         log.info(
@@ -477,13 +530,22 @@ def group_question(message):
             "Question processing failed chat_id=%s user_id=%s elapsed=%.2fs",
             message.chat.id, user_id, time.monotonic() - started,
         )
-        bot.reply_to(message, "Не получилось обработать запрос. Попробуйте позже.")
+        try:
+            tg_call(
+                bot.reply_to, message,
+                "Не получилось обработать запрос. Попробуйте позже.",
+            )
+        except Exception:
+            log.exception("Could not send failure reply chat_id=%s", message.chat.id)
     finally:
         if "done" in locals():
             done.set()
         if status:
             try:
-                bot.delete_message(message.chat.id, status.message_id)
+                tg_call(
+                    bot.delete_message, message.chat.id, status.message_id,
+                    attempts=2, delay=0.4,
+                )
             except Exception:
                 log.debug("Could not remove status", exc_info=True)
         lock.release()
