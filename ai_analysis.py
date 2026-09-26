@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from datetime import date, datetime, timedelta
 from typing import Callable
 
@@ -10,6 +12,37 @@ import requests
 
 import mysql_stats
 from settings import TIMEZONE
+
+log = logging.getLogger(__name__)
+
+
+def _preview(text: str | None, limit: int = 160) -> str:
+    value = " ".join((text or "").split())
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
+
+
+def _tool_result_summary(result: dict) -> str:
+    if not isinstance(result, dict):
+        return f"type={type(result).__name__}"
+    if result.get("error"):
+        return f"error={result['error']!r}"
+    parts = []
+    for key in (
+        "has_data", "dates_count", "creative_count", "matching_rows",
+        "returned", "truncated", "requires_disambiguation",
+    ):
+        if key in result:
+            parts.append(f"{key}={result[key]}")
+    for key, label in (
+        ("rows", "rows"), ("days", "days"), ("changes", "changes"),
+        ("creatives", "creatives"), ("matches", "matches"),
+        ("suggestions", "suggestions"),
+    ):
+        if key in result and isinstance(result[key], list):
+            parts.append(f"{label}={len(result[key])}")
+    return " ".join(parts) or "ok"
 
 
 SYSTEM = """Ты аналитик TGAds. Сегодня {today}, часовой пояс UTC+02:00.
@@ -200,6 +233,16 @@ class Analyst:
         self.base_url = base_url.rstrip("/")
 
     def call_tool(self, name: str, args: dict) -> dict:
+        started = time.monotonic()
+        result = self._call_tool(name, args)
+        log.info(
+            "Tool result name=%s summary=%s elapsed=%.2fs buyer_id=%s",
+            name, _tool_result_summary(result), time.monotonic() - started,
+            self.buyer_id,
+        )
+        return result
+
+    def _call_tool(self, name: str, args: dict) -> dict:
         if name not in {tool["function"]["name"] for tool in TOOLS}:
             return {"error": "Неизвестный инструмент"}
         today = datetime.now(TIMEZONE).date()
@@ -336,6 +379,10 @@ class Analyst:
                         "suggestions": sorted({r["creative_name"] for r in suggestions})[:15],
                     }
         except Exception:
+            log.exception(
+                "MySQL tool query failed name=%s buyer_id=%s date_from=%s date_to=%s",
+                name, self.buyer_id, result.get("date_from"), result.get("date_to"),
+            )
             return {"error": "MySQL недоступен или структура таблиц не поддерживается"}
         if not rows:
             return {**result, "has_data": False, "rows": []}
@@ -416,48 +463,94 @@ class Analyst:
             payload.update({"tools": TOOLS, "tool_choice": "auto"})
         if stream:
             payload["stream"] = True
-        response = requests.post(
-            self.base_url + "/chat/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"},
-            json=payload, stream=stream, timeout=90,
+        started = time.monotonic()
+        log.info(
+            "LLM request model=%s tools=%s stream=%s messages=%s buyer_id=%s",
+            self.model, tools, stream, len(messages), self.buyer_id,
         )
-        response.raise_for_status()
+        try:
+            response = requests.post(
+                self.base_url + "/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json=payload, stream=stream, timeout=90,
+            )
+            response.raise_for_status()
+        except requests.RequestException:
+            log.exception(
+                "LLM request failed model=%s tools=%s stream=%s elapsed=%.2fs",
+                self.model, tools, stream, time.monotonic() - started,
+            )
+            raise
+        log.info(
+            "LLM response status=%s tools=%s stream=%s elapsed=%.2fs",
+            response.status_code, tools, stream, time.monotonic() - started,
+        )
         return response
 
     def _run_tools(self, messages: list[dict],
                    on_status: Callable[[str], None] | None = None) -> tuple[list[dict], bool]:
         called = False
-        for _ in range(4):
+        # Hard cap against runaway model loops; one "round" = one model reply
+        # that may contain several parallel tool_calls.
+        max_rounds = 20
+        for round_no in range(1, max_rounds + 1):
             if on_status:
                 on_status("Изучаю запрос")
             choice = self._request(messages, tools=True).json()["choices"][0]["message"]
             calls = choice.get("tool_calls") or []
             if not calls:
+                log.info(
+                    "Tool loop finished round=%s called=%s buyer_id=%s",
+                    round_no, called, self.buyer_id,
+                )
                 return messages, called
+            names = [call.get("function", {}).get("name") for call in calls]
+            log.info(
+                "Tool round=%s/%s count=%s names=%s buyer_id=%s",
+                round_no, max_rounds, len(calls), names, self.buyer_id,
+            )
             messages.append({"role": "assistant", "content": choice.get("content"),
                              "tool_calls": calls})
             for call in calls:
+                name = call.get("function", {}).get("name")
                 if on_status:
-                    on_status(TOOL_PROGRESS.get(
-                        call.get("function", {}).get("name"), "Собираю данные"
-                    ))
+                    on_status(TOOL_PROGRESS.get(name, "Собираю данные"))
                 try:
                     args = json.loads(call["function"]["arguments"] or "{}")
-                    result = self.call_tool(call["function"]["name"], args)
+                    if not isinstance(args, dict):
+                        raise ValueError("Аргументы инструмента должны быть объектом")
+                    log.info(
+                        "Tool call round=%s/%s name=%s args=%s buyer_id=%s buyer=%s",
+                        round_no, max_rounds, name,
+                        json.dumps(args, ensure_ascii=False),
+                        self.buyer_id, self.buyer_name,
+                    )
+                    result = self.call_tool(name, args)
                 except (KeyError, TypeError, ValueError) as exc:
+                    log.warning(
+                        "Tool call failed name=%s error=%s",
+                        name, exc,
+                    )
                     result = {"error": str(exc)}
                 called |= "has_data" in result
                 messages.append({"role": "tool", "tool_call_id": call["id"],
                                  "content": json.dumps(result, ensure_ascii=False)})
                 if on_status:
                     on_status("Сверяю результаты")
-        raise RuntimeError("Превышено число вызовов инструментов")
+        log.warning(
+            "Tool call round limit reached (%s); answering with collected data "
+            "buyer_id=%s buyer=%s called=%s",
+            max_rounds, self.buyer_id, self.buyer_name, called,
+        )
+        return messages, called
 
     def _final(self, messages: list[dict], stream: bool,
                on_text: Callable[[str], None] | None = None) -> str:
         response = self._request(messages, stream=stream)
         if not stream:
-            return response.json()["choices"][0]["message"].get("content") or ""
+            text = response.json()["choices"][0]["message"].get("content") or ""
+            log.info("Final answer stream=False chars=%s", len(text))
+            return text
         chunks = []
         for line in response.iter_lines(decode_unicode=False):
             if isinstance(line, bytes):
@@ -475,21 +568,43 @@ class Analyst:
                 chunks.append(content)
                 if on_text:
                     on_text("".join(chunks))
-        return "".join(chunks)
+        text = "".join(chunks)
+        log.info("Final answer stream=True chars=%s", len(text))
+        return text
 
     def answer_stream(self, question: str, on_text=None, on_status=None,
                       history=None) -> str:
+        started = time.monotonic()
+        history_len = len(history or [])
+        log.info(
+            "Answer start buyer_id=%s buyer=%s history=%s question=%r",
+            self.buyer_id, self.buyer_name, history_len, _preview(question),
+        )
         messages, called = self._run_tools(self._messages(question, history), on_status)
         if not called:
+            log.warning(
+                "Answer aborted: no usable tool data buyer_id=%s elapsed=%.2fs",
+                self.buyer_id, time.monotonic() - started,
+            )
             return "Не удалось получить данные. Уточните период и попробуйте снова."
         if on_status:
             on_status("Формулирую ответ")
         try:
             answer = self._final(messages, True, on_text)
             if answer:
-                return answer[:3800]
+                text = answer[:3800]
+                log.info(
+                    "Answer done mode=stream chars=%s elapsed=%.2fs preview=%r",
+                    len(text), time.monotonic() - started, _preview(text),
+                )
+                return text
         except (requests.RequestException, ValueError, UnicodeError):
-            pass
+            log.warning("Streaming final answer failed; falling back", exc_info=True)
         if on_status:
             on_status("Готовлю итог")
-        return self._final(messages, False)[:3800] or "Нет ответа от модели."
+        text = (self._final(messages, False)[:3800] or "Нет ответа от модели.")
+        log.info(
+            "Answer done mode=fallback chars=%s elapsed=%.2fs preview=%r",
+            len(text), time.monotonic() - started, _preview(text),
+        )
+        return text

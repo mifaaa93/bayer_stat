@@ -272,3 +272,23 @@ def test_tool_statuses_are_user_friendly(tool_name, expected):
     assert expected in statuses
     assert all("MySQL" not in status and "tool" not in status.casefold()
                for status in statuses)
+
+
+def test_tool_round_limit_returns_collected_data_without_raising():
+    analyst = Analyst("5", "Buyer", "key", "model", "https://example.test/v1")
+    keep_calling = Mock()
+    keep_calling.json.return_value = {
+        "choices": [{"message": {
+            "content": None,
+            "tool_calls": [{"id": "call-1", "function": {
+                "name": "get_overview",
+                "arguments": '{"date_from": "сегодня"}',
+            }}],
+        }}]
+    }
+    with patch.object(analyst, "_request", return_value=keep_calling) as request:
+        with patch.object(analyst, "call_tool", return_value={"has_data": True}):
+            messages, called = analyst._run_tools(analyst._messages("данные"))
+    assert called
+    assert request.call_count == 20
+    assert sum(1 for item in messages if item.get("role") == "tool") == 20

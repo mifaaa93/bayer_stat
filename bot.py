@@ -20,10 +20,10 @@ from db import (
     bind_group, clear_chat_history, count_groups, get_group, init_db,
     list_groups, load_chat_history, open_db, remove_group, save_chat_turn,
 )
-from settings import DATABASE, admin_ids
+from settings import DATABASE, configure_logging, admin_ids
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+configure_logging()
 log = logging.getLogger("buyer-bot")
 bot = telebot.TeleBot(os.environ["TELEGRAM_BOT_TOKEN"], parse_mode=None)
 ADMINS = admin_ids()
@@ -110,6 +110,7 @@ def show_buyers(chat_id: int, user_id: int, message_id: int) -> None:
 def start(message):
     if not admin_private(message):
         return
+    log.info("Admin open panel user_id=%s", message.from_user.id)
     bot.send_message(
         message.chat.id, "Панель управления группами.\n"
         "Добавление: выберите группу кнопкой Telegram, затем байера из traffers.\n"
@@ -122,6 +123,8 @@ def start(message):
 def reset(message):
     if not admin_private(message):
         return
+    log.info("Admin reset history user_id=%s chat_id=%s",
+             message.from_user.id, message.chat.id)
     with closing(open_db(DATABASE)) as conn:
         clear_chat_history(conn, message.chat.id)
     bot.send_message(message.chat.id, "Контекст этой переписки очищен.",
@@ -136,10 +139,19 @@ def shared_chat(message):
     with state_lock:
         state = pending.get(message.from_user.id)
         if not state or state.get("stage") != "request" or shared.request_id != 1:
+            log.info(
+                "Ignored shared chat user_id=%s chat_id=%s stage=%s",
+                message.from_user.id, shared.chat_id,
+                state.get("stage") if state else None,
+            )
             return
         state["chat_id"] = shared.chat_id
         state["title"] = shared.title or f"Группа {shared.chat_id}"
         state["username"] = shared.username
+    log.info(
+        "Admin selected group user_id=%s chat_id=%s title=%r",
+        message.from_user.id, shared.chat_id, shared.title,
+    )
     # Telegram cannot edit a message carrying ReplyKeyboardMarkup. Restore
     # the ordinary admin keyboard in a separate message and keep this one
     # editable throughout buyer selection, confirmation and success.
@@ -286,6 +298,11 @@ def admin_callback(call):
                 bind_group(conn, chat.id, chat.title or state["title"],
                            chat.username or state.get("username"), current["id"], current["name"])
             reset_pending(uid)
+            log.info(
+                "Bound group chat_id=%s title=%r buyer_id=%s buyer=%s by_user=%s",
+                chat.id, chat.title or state["title"], current["id"],
+                current["name"], uid,
+            )
             kb = types.InlineKeyboardMarkup()
             kb.add(types.InlineKeyboardButton(
                 "📋 Посмотреть все группы", callback_data="page:0",
@@ -323,12 +340,16 @@ def admin_callback(call):
             _, group_id, page = data.split(":")
             with closing(open_db(DATABASE)) as conn:
                 remove_group(conn, int(group_id))
+            log.info("Removed group chat_id=%s by_user=%s", group_id, uid)
             group_list(chat_id, int(page), mid)
+        else:
+            log.info("Unhandled admin callback data=%r user_id=%s", data, uid)
         bot.answer_callback_query(call.id)
     except (ValueError, RuntimeError) as exc:
+        log.info("Admin callback rejected user_id=%s data=%r error=%s", uid, data, exc)
         bot.answer_callback_query(call.id, str(exc)[:180], show_alert=True)
     except Exception:
-        log.exception("Admin callback failed")
+        log.exception("Admin callback failed user_id=%s data=%r", uid, data)
         bot.answer_callback_query(call.id, "Ошибка доступа к базе или Telegram", show_alert=True)
 
 
@@ -350,18 +371,25 @@ def is_addressed(message) -> bool:
 def group_question(message):
     if not is_addressed(message):
         return
-    log.info("Received group query chat_id=%s", message.chat.id)
+    user_id = message.from_user.id if message.from_user else None
+    log.info(
+        "Received group query chat_id=%s user_id=%s message_id=%s",
+        message.chat.id, user_id, message.message_id,
+    )
     with closing(open_db(DATABASE)) as conn:
         group = get_group(conn, message.chat.id)
         history = load_chat_history(conn, message.chat.id) if group else []
     if not group:
+        log.warning("Group is not bound chat_id=%s user_id=%s", message.chat.id, user_id)
         return
     lock = chat_locks.setdefault(message.chat.id, threading.Lock())
     if not lock.acquire(blocking=False):
+        log.info("Group query busy chat_id=%s user_id=%s", message.chat.id, user_id)
         bot.reply_to(message, "Ещё обрабатываю предыдущий вопрос. Подождите.")
         return
     status = None
     answer = None
+    started = time.monotonic()
     try:
         question = re.sub(
             rf"@{re.escape(identity.username)}\b",
@@ -371,7 +399,13 @@ def group_question(message):
         )
         question = question.strip()
         if not question:
+            log.info("Empty question after mention strip chat_id=%s", message.chat.id)
             return
+        log.info(
+            "Processing question chat_id=%s buyer_id=%s buyer=%s history=%s question=%r",
+            message.chat.id, group["buyer_id"], group["buyer_name"],
+            len(history), " ".join(question.split())[:200],
+        )
         status = bot.reply_to(message, "Анализирую вопрос…")
         analyst = Analyst(
             group["buyer_id"], group["buyer_name"], os.environ["OPENAI_API_KEY"],
@@ -402,6 +436,7 @@ def group_question(message):
         def on_status(label):
             nonlocal stage
             stage = label
+            log.debug("Progress status chat_id=%s label=%s", message.chat.id, label)
             progress(label + "…", True)
 
         def on_text(text):
@@ -410,11 +445,11 @@ def group_question(message):
             progress(text)
 
         def heartbeat():
-            started = time.monotonic()
+            started_hb = time.monotonic()
             while not done.wait(12):
                 if streaming:
                     return
-                progress(f"{stage} ({int(time.monotonic()-started)} с)…", True)
+                progress(f"{stage} ({int(time.monotonic()-started_hb)} с)…", True)
 
         threading.Thread(target=heartbeat, daemon=True).start()
         answer = analyst.answer_stream(question, on_text=on_text,
@@ -425,12 +460,23 @@ def group_question(message):
                 message.chat.id, types.InputRichMessage(markdown=answer),
                 reply_parameters=types.ReplyParameters(message_id=message.message_id),
             )
+            log.info("Sent rich answer chat_id=%s chars=%s", message.chat.id, len(answer or ""))
         except Exception:
+            log.warning("Rich message failed; plain reply chat_id=%s", message.chat.id,
+                        exc_info=True)
             bot.reply_to(message, answer, parse_mode=None)
         with closing(open_db(DATABASE)) as conn:
             save_chat_turn(conn, message.chat.id, question, answer)
+        log.info(
+            "Question done chat_id=%s buyer_id=%s chars=%s elapsed=%.2fs",
+            message.chat.id, group["buyer_id"], len(answer or ""),
+            time.monotonic() - started,
+        )
     except Exception:
-        log.exception("Question processing failed")
+        log.exception(
+            "Question processing failed chat_id=%s user_id=%s elapsed=%.2fs",
+            message.chat.id, user_id, time.monotonic() - started,
+        )
         bot.reply_to(message, "Не получилось обработать запрос. Попробуйте позже.")
     finally:
         if "done" in locals():
@@ -446,7 +492,7 @@ def group_question(message):
 def main():
     with closing(open_db(DATABASE)) as conn:
         init_db(conn)
-    log.info("Starting Telegram analytics bot")
+    log.info("Starting Telegram analytics bot database=%s", DATABASE)
     bot.infinity_polling(skip_pending=True, allowed_updates=["message", "callback_query"],
                          timeout=30, long_polling_timeout=30)
 
