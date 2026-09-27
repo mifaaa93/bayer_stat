@@ -12,6 +12,7 @@ import threading
 import time
 from collections import deque
 from contextlib import closing
+from queue import Full, Queue
 from typing import Callable, TypeVar
 
 import requests
@@ -27,6 +28,12 @@ from db import (
     record_group_message, remember_topic, remove_group, update_group_topic,
 )
 from settings import DATABASE, REASONING_EFFORT, configure_logging, admin_ids
+from settings import (
+    FFMPEG_BIN,
+    TRANSCRIPTION_MODEL,
+    TRANSCRIPTION_QUEUE_SIZE,
+)
+from voice_transcription import VoiceTranscriber
 
 
 configure_logging()
@@ -36,6 +43,8 @@ ADMINS = admin_ids()
 pending: dict[int, dict] = {}
 state_lock = threading.RLock()
 group_queues: dict[int, dict] = {}
+voice_queue: Queue[dict] = Queue(maxsize=TRANSCRIPTION_QUEUE_SIZE)
+voice_worker_started = False
 identity = None
 ALL_TOPICS = "General — вся группа"
 TRIGGER_WORD = re.compile(r"(?<!\w)кит(?!\w)", re.IGNORECASE | re.UNICODE)
@@ -773,7 +782,12 @@ def topic_allowed(group: dict, thread_id: int) -> bool:
     return group["topic_id"] is None or int(group["topic_id"]) == thread_id
 
 
-def enqueue_question(message, question: str, group: dict | None = None) -> None:
+def enqueue_question(
+    message,
+    question: str,
+    group: dict | None = None,
+    reply_override: bool = False,
+) -> None:
     chat_id = message.chat.id
     with state_lock:
         queue = group_queues.setdefault(chat_id, {"items": deque(), "running": False})
@@ -785,12 +799,105 @@ def enqueue_question(message, question: str, group: dict | None = None) -> None:
                 (group["buyer_id"], group["topic_id"])
                 if group is not None else None
             ),
+            "reply_override": reply_override,
         })
         if queue["running"]:
             log.info("Queued group question chat_id=%s size=%s", chat_id, len(queue["items"]))
             return
         queue["running"] = True
         threading.Thread(target=process_question_queue, args=(chat_id,), daemon=True).start()
+
+
+def is_reply_to_bot(message) -> bool:
+    reply = getattr(message, "reply_to_message", None)
+    bot_user = get_bot_identity()
+    return bool(
+        reply and reply.from_user and reply.from_user.id == bot_user.id
+    )
+
+
+def queue_voice(message, group: dict, reply_override: bool) -> None:
+    job = {
+        "message": message,
+        "group_scope": (group["buyer_id"], group["topic_id"]),
+        "reply_override": reply_override,
+        "thread_id": message_thread_id(message),
+    }
+    try:
+        voice_queue.put_nowait(job)
+    except Full:
+        log.warning("Voice transcription queue is full chat_id=%s", message.chat.id)
+        tg_call(
+            bot.reply_to, message,
+            "Очередь голосовых переполнена. Попробуйте отправить голосовое позже.",
+            attempts=1,
+        )
+
+
+def transcription_worker() -> None:
+    transcriber = VoiceTranscriber(
+        os.environ["OPENAI_API_KEY"],
+        os.getenv("OPENAI_BASE_URL", "https://ru.cheapvibecode.ru/v1"),
+        TRANSCRIPTION_MODEL,
+        FFMPEG_BIN,
+    )
+    while True:
+        job = voice_queue.get()
+        message = job["message"]
+        try:
+            file_info = tg_call(
+                bot.get_file, message.voice.file_id, attempts=2,
+            )
+            audio = tg_call(
+                bot.download_file, file_info.file_path, attempts=2,
+            )
+            text = transcriber.transcribe(audio, ".oga")
+            with closing(open_db(DATABASE)) as conn:
+                group = get_group(conn, message.chat.id)
+                if not group:
+                    continue
+                if not topic_allowed(group, job["thread_id"]) and not job["reply_override"]:
+                    continue
+                # A selected-topic group stores context only in the selected
+                # topic. A reply override outside it is answered in place but
+                # does not pollute the selected-topic context.
+                if topic_allowed(group, job["thread_id"]):
+                    record_group_message(
+                        conn, message.chat.id, message.message_id,
+                        job["thread_id"], "user", message_author(message), text,
+                    )
+            enqueue_question(message, text, group, job["reply_override"])
+            log.info(
+                "Voice transcribed chat_id=%s message_id=%s chars=%s",
+                message.chat.id, message.message_id, len(text),
+            )
+        except Exception:
+            log.exception(
+                "Voice transcription failed chat_id=%s message_id=%s",
+                message.chat.id, getattr(message, "message_id", None),
+            )
+            try:
+                tg_call(
+                    bot.reply_to, message,
+                    "Не удалось расшифровать голосовое сообщение.",
+                    attempts=1,
+                )
+            except Exception:
+                log.exception("Could not report voice transcription failure")
+        finally:
+            voice_queue.task_done()
+
+
+def start_transcription_worker() -> None:
+    global voice_worker_started
+    if voice_worker_started:
+        return
+    voice_worker_started = True
+    threading.Thread(
+        target=transcription_worker,
+        name="voice-transcription",
+        daemon=True,
+    ).start()
 
 
 def process_question_queue(chat_id: int) -> None:
@@ -871,7 +978,8 @@ def process_question(request: dict) -> None:
             )
         else:
             history = []
-    if (not group or not topic_allowed(group, request["thread_id"])
+    topic_ok = bool(group and topic_allowed(group, request["thread_id"]))
+    if (not group or (not topic_ok and not request.get("reply_override"))
             or (request.get("scope") is not None
                 and request["scope"] != (group["buyer_id"], group["topic_id"]))):
         log.warning("Group is not bound chat_id=%s user_id=%s", message.chat.id, user_id)
@@ -993,6 +1101,17 @@ def group_message(message):
                 conn, chat_id, message.message_id, thread_id,
                 "user", author, content,
             )
+    if (
+        group
+        and getattr(message, "content_type", None) == "voice"
+        and getattr(message, "voice", None)
+        and (
+            topic_allowed(group, thread_id)
+            or is_reply_to_bot(message)
+        )
+    ):
+        queue_voice(message, group, is_reply_to_bot(message))
+        return
     if not group or not topic_allowed(group, thread_id):
         return
     if getattr(message, "content_type", None) != "text" and not getattr(message, "caption", None):
@@ -1013,6 +1132,7 @@ bot.message_handlers.insert(0, bot.message_handlers.pop())
 def main():
     with closing(open_db(DATABASE)) as conn:
         init_db(conn)
+    start_transcription_worker()
     log.info("Starting Telegram analytics bot database=%s", DATABASE)
     bot.infinity_polling(skip_pending=True, allowed_updates=["message", "callback_query"],
                          timeout=30, long_polling_timeout=30)
