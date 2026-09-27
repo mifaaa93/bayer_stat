@@ -235,6 +235,15 @@ def test_tool_schemas_are_unique_and_do_not_expose_buyer_selection():
         assert parameters["additionalProperties"] is False
 
 
+def test_recent_group_conversation_is_included_without_unbounded_growth():
+    model = Analyst("5", "Buyer", "key", "model", "https://example.test/v1")
+    history = [{"role": "user", "content": f"Alice: сообщение {n}"} for n in range(40)]
+    messages = model._messages("кит, уточни период", history)
+    assert len(messages) == 32  # system + last 30 group messages + current question
+    assert messages[1]["content"] == "Alice: сообщение 10"
+    assert messages[-1]["content"] == "кит, уточни период"
+
+
 @pytest.mark.parametrize(
     ("tool_name", "expected"),
     [

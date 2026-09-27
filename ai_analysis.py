@@ -54,6 +54,9 @@ compare_periods или compare_creatives для сравнения и
 find_anomalies для резких изменений, get_data_availability для покрытия дат.
 get_statistics — универсальный
 детальный срез. Можно вызывать несколько инструментов в одном ответе.
+Если в одном сообщении перечислено несколько вопросов, проверь каждый
+самостоятельно нужным инструментом и ответь на все одним сообщением,
+сохраняя порядок и разделяя ответы по вопросу и автору.
 Если сообщение не про статистику, слишком общее или без периода/метрик
 (например «тест», «привет»), не вызывай инструменты: коротко попроси
 уточнить вопрос — период и что именно нужно.
@@ -462,11 +465,12 @@ class Analyst:
             today=datetime.now(TIMEZONE).date(), buyer_name=self.buyer_name,
             buyer_id=self.buyer_id)}]
         messages.extend(
-            {"role": item["role"], "content": item["content"][:3800]}
-            for item in (history or [])[-12:]
+            {"role": item["role"], "content": item["content"][:1200]}
+            for item in (history or [])[-30:]
             if item.get("role") in {"user", "assistant"} and item.get("content")
         )
-        messages.append({"role": "user", "content": question[:4000]})
+        # A queued batch can contain several bounded questions plus authors.
+        messages.append({"role": "user", "content": question[:12000]})
         return messages
 
     def _request(self, messages, stream=False, tools=False):
