@@ -902,38 +902,12 @@ def process_question(request: dict) -> None:
             os.getenv("OPENAI_BASE_URL", "https://ru.cheapvibecode.ru/v1"),
             reasoning_effort=REASONING_EFFORT,
         )
-        last_update = time.monotonic()
-        current_status = ""
         done = threading.Event()
-        progress_guard = threading.RLock()
-
-        def progress(text):
-            nonlocal last_update, current_status
-            with progress_guard:
-                if done.is_set():
-                    return
-                text = text[:3800]
-                now = time.monotonic()
-                if text == current_status or now - last_update < TG_GROUP_INTERVAL:
-                    return
-                with _tg_rate_lock:
-                    if now < max(
-                        _tg_not_before.get("global", 0),
-                        _tg_not_before.get(message.chat.id, 0),
-                    ):
-                        return
-                last_update = now
-                try:
-                    tg_call(
-                        bot.edit_message_text, text, message.chat.id,
-                        status.message_id, attempts=1,
-                    )
-                    current_status, last_update = text, now
-                except Exception:
-                    log.debug("Progress update failed", exc_info=True)
-
-        answer = analyst.answer_stream(question, on_text=progress,
-                                       on_status=None, history=history)
+        # Provider streaming remains enabled internally, but Telegram receives
+        # only the initial status and one final rich edit.
+        answer = analyst.answer_stream(
+            question, on_text=None, on_status=None, history=history,
+        )
         done.set()
         with closing(open_db(DATABASE)) as conn:
             current = get_group(conn, message.chat.id)

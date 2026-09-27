@@ -14,6 +14,7 @@ DATABASE = os.getenv("DATABASE_PATH", "data/bot.sqlite3")
 LOG_PATH = os.getenv("LOG_PATH") or str(Path(DATABASE).expanduser().resolve().with_name("bot.log"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "").strip() or None
+SERVICE_TIER = os.getenv("OPENAI_SERVICE_TIER", "").strip() or None
 TIMEZONE = timezone(timedelta(hours=2))
 
 _LOGGING_CONFIGURED = False

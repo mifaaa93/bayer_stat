@@ -6,3 +6,4 @@ __pycache__/
 cred.json
 sheet.csv
 .env
+DEPLOY.md

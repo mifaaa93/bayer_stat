@@ -235,6 +235,28 @@ def test_tool_schemas_are_unique_and_do_not_expose_buyer_selection():
         assert parameters["additionalProperties"] is False
 
 
+def test_tool_request_enables_parallel_calls():
+    model = Analyst("5", "Buyer", "key", "model", "https://example.test/v1")
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+    with patch("ai_analysis.requests.post", return_value=response) as request:
+        model._request([{"role": "user", "content": "test"}], tools=True)
+    payload = request.call_args.kwargs["json"]
+    assert payload["parallel_tool_calls"] is True
+
+
+def test_service_tier_is_forwarded_when_configured(monkeypatch):
+    model = Analyst("5", "Buyer", "key", "model", "https://example.test/v1")
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+    monkeypatch.setattr("ai_analysis.SERVICE_TIER", "fast")
+    with patch("ai_analysis.requests.post", return_value=response) as request:
+        model._request([{"role": "user", "content": "test"}])
+    assert request.call_args.kwargs["json"]["service_tier"] == "fast"
+
+
 def test_recent_group_conversation_is_included_without_unbounded_growth():
     model = Analyst("5", "Buyer", "key", "model", "https://example.test/v1")
     history = [{"role": "user", "content": f"Alice: сообщение {n}"} for n in range(40)]
@@ -345,3 +367,14 @@ def test_reasoning_effort_is_sent_in_payload():
         analyst._request([{"role": "user", "content": "hi"}], tools=False)
     payload = post.call_args.kwargs["json"]
     assert payload["reasoning_effort"] == "medium"
+
+
+def test_final_answer_is_non_streaming():
+    analyst = Analyst("5", "Buyer", "key", "model", "https://example.test/v1")
+    response = Mock()
+    response.json.return_value = {
+        "choices": [{"message": {"content": "готово"}}]
+    }
+    with patch.object(analyst, "_request", return_value=response) as request:
+        assert analyst._final([{"role": "user", "content": "test"}]) == "готово"
+    request.assert_called_once_with([{"role": "user", "content": "test"}], stream=False)

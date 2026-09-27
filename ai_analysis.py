@@ -11,7 +11,7 @@ from typing import Callable
 import requests
 
 import mysql_stats
-from settings import TIMEZONE
+from settings import SERVICE_TIER, TIMEZONE
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +54,11 @@ compare_periods или compare_creatives для сравнения и
 find_anomalies для резких изменений, get_data_availability для покрытия дат.
 get_statistics — универсальный
 детальный срез. Можно вызывать несколько инструментов в одном ответе.
+Если нужны независимые данные, сравнения или проверки, верни все нужные
+tool_calls одним набором в одном раунде; не жди результат одного независимого
+инструмента перед вызовом другого. Последовательные вызовы оставляй только
+для зависимых запросов. Все результаты набора будут переданы обратно одним
+сообщением для итогового анализа.
 Если в одном сообщении перечислено несколько вопросов, проверь каждый
 самостоятельно нужным инструментом и ответь на все одним сообщением,
 сохраняя порядок и разделяя ответы по вопросу и автору.
@@ -476,11 +481,17 @@ class Analyst:
     def _request(self, messages, stream=False, tools=False):
         payload = {"model": self.model, "messages": messages, "temperature": 0.1}
         if tools:
-            payload.update({"tools": TOOLS, "tool_choice": "auto"})
+            payload.update({
+                "tools": TOOLS,
+                "tool_choice": "auto",
+                "parallel_tool_calls": True,
+            })
         if stream:
             payload["stream"] = True
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
+        if SERVICE_TIER:
+            payload["service_tier"] = SERVICE_TIER
         started = time.monotonic()
         log.info(
             "LLM request model=%s tools=%s stream=%s reasoning=%s messages=%s buyer_id=%s",
@@ -570,36 +581,15 @@ class Analyst:
         )
         return messages, has_data, tools_used, ""
 
-    def _final(self, messages: list[dict], stream: bool,
-               on_text: Callable[[str], None] | None = None) -> str:
-        response = self._request(messages, stream=stream)
-        if not stream:
-            text = response.json()["choices"][0]["message"].get("content") or ""
-            log.info("Final answer stream=False chars=%s", len(text))
-            return text
-        chunks = []
-        for line in response.iter_lines(decode_unicode=False):
-            if isinstance(line, bytes):
-                line = line.decode("utf-8")
-            if not line or not line.startswith("data:"):
-                continue
-            raw = line[5:].strip()
-            if raw == "[DONE]":
-                break
-            try:
-                content = json.loads(raw)["choices"][0].get("delta", {}).get("content")
-            except (ValueError, KeyError, IndexError):
-                continue
-            if content:
-                chunks.append(content)
-                if on_text:
-                    on_text("".join(chunks))
-        text = "".join(chunks)
-        log.info("Final answer stream=True chars=%s", len(text))
+    def _final(self, messages: list[dict]) -> str:
+        response = self._request(messages, stream=False)
+        text = response.json()["choices"][0]["message"].get("content") or ""
+        log.info("Final answer stream=False chars=%s", len(text))
         return text
 
     def answer_stream(self, question: str, on_text=None, on_status=None,
                       history=None) -> str:
+        """Compatibility name; final generation is deliberately non-streaming."""
         started = time.monotonic()
         history_len = len(history or [])
         log.info(
@@ -625,8 +615,6 @@ class Analyst:
             return NO_DATA_REPLY
         if direct:
             text = direct[:3800]
-            if on_text:
-                on_text(text)
             log.info(
                 "Answer done mode=direct chars=%s elapsed=%.2fs preview=%r",
                 len(text), time.monotonic() - started, _preview(text),
@@ -634,22 +622,9 @@ class Analyst:
             return text
         if on_status:
             on_status("Формулирую ответ")
-        try:
-            answer = self._final(messages, True, on_text)
-            if answer:
-                text = answer[:3800]
-                log.info(
-                    "Answer done mode=stream chars=%s elapsed=%.2fs preview=%r",
-                    len(text), time.monotonic() - started, _preview(text),
-                )
-                return text
-        except (requests.RequestException, ValueError, UnicodeError):
-            log.warning("Streaming final answer failed; falling back", exc_info=True)
-        if on_status:
-            on_status("Готовлю итог")
-        text = (self._final(messages, False)[:3800] or "Нет ответа от модели.")
+        text = (self._final(messages)[:3800] or "Нет ответа от модели.")
         log.info(
-            "Answer done mode=fallback chars=%s elapsed=%.2fs preview=%r",
+            "Answer done mode=nonstream chars=%s elapsed=%.2fs preview=%r",
             len(text), time.monotonic() - started, _preview(text),
         )
         return text
