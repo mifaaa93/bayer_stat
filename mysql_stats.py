@@ -369,3 +369,105 @@ def source_statistics(
         "source_types": sorted({row["source_type"] for row in rows}),
         "source_mapping": "exact for unique creative/date; ambiguous events are not duplicated",
     }
+
+
+def country_statistics(
+    conn, buyer_id: str, first: date, last: date,
+    source: str | None = None, country: str | None = None,
+    creative: str | None = None,
+) -> list[dict]:
+    """Country registrations/FTD joined to the bound buyer and source.
+
+    The country table has no buyer/source ID, so ownership is resolved through
+    normalized date + creative name in creos. Ambiguous ownership is marked.
+    """
+    cols = discover(conn)
+    blogger_cols = _columns_for(conn, "bloggers")
+    blog_id = quoted(pick(blogger_cols, ("id",), "bloggers"))
+    blog_type = quoted(pick(blogger_cols, ("traf_type",), "bloggers"))
+    blog_name = quoted(pick(blogger_cols, ("blogger_name", "blogger"), "bloggers"))
+    cdate, cname, cbuyer = (quoted(cols[key]) for key in
+                           ("creo_date", "creo_name", "creo_buyer"))
+    from datetime import timedelta
+    end = last + timedelta(days=1)
+    source_filter = "AND owners.source_type=%s" if source else ""
+    country_filter = "AND cs.country=%s" if country else ""
+    creative_filter = "AND LOWER(cs.creative_name)=LOWER(%s)" if creative else ""
+    # Existing imported test records have two date representations for one
+    # country/creative/day. MAX deduplicates that legacy pair; future rows
+    # should have unique keys as specified by the owner.
+    query = f"""
+        SELECT cs.stat_date, cs.creative_name, cs.country,
+               cs.regs, cs.ftd,
+               owners.source_type, owners.source_name,
+               ownership.owner_count, ownership.source_count
+        FROM (
+            SELECT LEFT(date,10) AS stat_date, creo_name AS creative_name,
+                   country, MAX(COALESCE(count_reg,0)) AS regs,
+                   MAX(COALESCE(count_ftd,0)) AS ftd
+            FROM buyer_stats_today_start_sub_country
+            WHERE LEFT(date,10) >= %s AND LEFT(date,10) < %s
+            GROUP BY LEFT(date,10), creo_name, country
+        ) cs
+        JOIN (
+            SELECT LEFT(c.{cdate},10) AS stat_date,
+                   c.{cname} AS creative_name,
+                   c.{cbuyer} AS buyer_id, c.id_blog,
+                   COALESCE(b.{blog_type},'unknown') AS source_type,
+                   COALESCE(b.{blog_name},c.id_blog) AS source_name
+            FROM creos c
+            LEFT JOIN bloggers b ON b.{blog_id}=c.id_blog
+            WHERE c.{cbuyer}=%s
+              AND LEFT(c.{cdate},10)>=%s AND LEFT(c.{cdate},10)<%s
+            GROUP BY LEFT(c.{cdate},10),c.{cname},c.{cbuyer},
+                     c.id_blog,b.{blog_type},b.{blog_name}
+        ) owners
+          ON owners.stat_date=cs.stat_date
+         AND owners.creative_name=cs.creative_name
+        JOIN (
+            SELECT LEFT({cdate},10) AS stat_date,
+                   {cname} AS creative_name,
+                   COUNT(DISTINCT {cbuyer}) AS owner_count,
+                   COUNT(DISTINCT id_blog) AS source_count
+            FROM creos
+            WHERE LEFT({cdate},10)>=%s AND LEFT({cdate},10)<%s
+            GROUP BY LEFT({cdate},10),{cname}
+        ) ownership
+          ON ownership.stat_date=cs.stat_date
+         AND ownership.creative_name=cs.creative_name
+        WHERE 1=1 {source_filter} {country_filter} {creative_filter}
+        ORDER BY cs.stat_date, cs.regs DESC, cs.country
+    """
+    params = [
+        first.isoformat(), end.isoformat(),
+        buyer_id, first.isoformat(), end.isoformat(),
+        first.isoformat(), end.isoformat(),
+    ]
+    if source:
+        params.append(source)
+    if country:
+        params.append(country)
+    if creative:
+        params.append(creative)
+    with conn.cursor() as cursor:
+        cursor.execute(query, params)
+        result: list[dict] = []
+        seen_ambiguous: set[tuple[str, str, str]] = set()
+        for row in cursor.fetchall():
+            exact = int(row["owner_count"]) == 1 and int(row["source_count"]) == 1
+            key = (str(row["stat_date"]), row["creative_name"], row["country"])
+            if not exact and key in seen_ambiguous:
+                continue
+            if not exact:
+                seen_ambiguous.add(key)
+            result.append({
+                "stat_date": str(row["stat_date"]),
+                "creative_name": row["creative_name"],
+                "country": row["country"],
+                "regs": int(row["regs"] or 0) if exact else None,
+                "ftd": int(row["ftd"] or 0) if exact else None,
+                "source_type": str(row["source_type"]) if exact else None,
+                "source_name": str(row["source_name"]) if exact else None,
+                "attribution": "exact" if exact else "ambiguous",
+            })
+        return result

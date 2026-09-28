@@ -99,7 +99,7 @@ def _telegram_chat_id(action, args, kwargs) -> int | None:
     return value if isinstance(value, int) else None
 
 
-def _wait_for_telegram_slot(chat_id: int | None) -> None:
+def _wait_for_telegram_slot(chat_id: int | None, skip_if_busy: bool = False) -> bool:
     while True:
         with _tg_rate_lock:
             now = time.monotonic()
@@ -110,7 +110,9 @@ def _wait_for_telegram_slot(chat_id: int | None) -> None:
             if remaining <= 0:
                 if chat_id is not None and chat_id < 0:
                     _tg_not_before[chat_id] = now + TG_GROUP_INTERVAL
-                return
+                return True
+            if skip_if_busy:
+                return False
         time.sleep(remaining)
 
 
@@ -125,12 +127,13 @@ def _transient_telegram(exc: BaseException) -> bool:
 
 
 def tg_call(action: Callable[..., T], *args, attempts: int = 3,
-            delay: float = 0.8, **kwargs) -> T:
+            delay: float = 0.8, skip_if_busy: bool = False, **kwargs) -> T | None:
     """Respect Telegram flood waits and reserve a per-group request slot."""
     last: BaseException | None = None
     chat_id = _telegram_chat_id(action, args, kwargs)
     for attempt in range(1, attempts + 1):
-        _wait_for_telegram_slot(chat_id)
+        if not _wait_for_telegram_slot(chat_id, skip_if_busy=skip_if_busy):
+            return None
         try:
             return action(*args, **kwargs)
         except Exception as exc:
@@ -1015,10 +1018,33 @@ def process_question(request: dict) -> None:
             reasoning_effort=REASONING_EFFORT,
         )
         done = threading.Event()
+        post_tool_status_sent = False
+
+        def after_tool_batch():
+            nonlocal post_tool_status_sent
+            # This is best-effort and intentionally non-blocking. If the
+            # per-chat Telegram slot is occupied, skip the edit and continue
+            # with the next AI request.
+            if post_tool_status_sent:
+                return
+            try:
+                sent_status = tg_call(
+                    bot.edit_message_text,
+                    "Данные получены, анализирую результаты…",
+                    message.chat.id,
+                    status.message_id,
+                    attempts=1,
+                    skip_if_busy=True,
+                )
+                post_tool_status_sent = sent_status is not None
+            except Exception:
+                log.debug("Could not publish post-tool status", exc_info=True)
+
         # Provider streaming remains enabled internally, but Telegram receives
         # only the initial status and one final rich edit.
         answer = analyst.answer_stream(
             question, on_text=None, on_status=None, history=history,
+            after_tool_batch=after_tool_batch,
         )
         done.set()
         with closing(open_db(DATABASE)) as conn:

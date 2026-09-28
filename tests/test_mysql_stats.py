@@ -226,7 +226,7 @@ def test_all_ai_tools_belong_to_bound_buyer(monkeypatch):
 
 def test_tool_schemas_are_unique_and_do_not_expose_buyer_selection():
     names = [item["function"]["name"] for item in TOOLS]
-    assert len(names) == len(set(names)) == 11
+    assert len(names) == len(set(names)) == 13
     assert {"get_creative", "compare_periods", "get_funnel",
             "get_data_availability", "find_anomalies"} <= set(names)
     for tool in TOOLS:
@@ -378,3 +378,142 @@ def test_final_answer_is_non_streaming():
     with patch.object(analyst, "_request", return_value=response) as request:
         assert analyst._final([{"role": "user", "content": "test"}]) == "готово"
     request.assert_called_once_with([{"role": "user", "content": "test"}], stream=False)
+
+
+def test_tool_batch_callback_runs_after_all_results():
+    analyst = Analyst("5", "Buyer", "key", "model", "https://example.test/v1")
+    first = Mock()
+    first.json.return_value = {
+        "choices": [{"message": {
+            "content": None,
+            "tool_calls": [
+                {"id": "a", "function": {"name": "get_overview", "arguments": "{}"}},
+                {"id": "b", "function": {"name": "get_funnel", "arguments": "{}"}},
+            ],
+        }}]
+    }
+    second = Mock()
+    second.json.return_value = {
+        "choices": [{"message": {"content": "готово", "tool_calls": []}}]
+    }
+    calls = []
+    with patch.object(analyst, "_request", side_effect=[first, second]):
+        with patch.object(analyst, "call_tool", return_value={"has_data": True}):
+            analyst._run_tools(
+                analyst._messages("данные"),
+                after_tool_batch=lambda: calls.append("after_batch"),
+            )
+    assert calls == ["after_batch"]
+
+
+def test_country_sql_is_read_only_parameterized_and_deduplicates_old_dates(monkeypatch):
+    monkeypatch.setenv("MYSQL_DATABASE", "test")
+
+    class CountryCursor(Cursor):
+        def __init__(self, columns):
+            super().__init__(columns)
+            self.calls = []
+
+        def execute(self, sql, params=()):
+            super().execute(sql, params)
+            self.calls.append((sql, params))
+
+        def fetchall(self):
+            if "information_schema" in self.last:
+                if self.params[1] == "bloggers":
+                    return [{"COLUMN_NAME": value} for value in
+                            ("id", "traf_type", "blogger_name")]
+                return super().fetchall()
+            return [
+                {"stat_date": date(2026, 9, 28), "creative_name": "Crypto",
+                 "country": "SA", "regs": 3, "ftd": 1,
+                 "source_type": "ТГ", "source_name": "рами",
+                 "owner_count": 1, "source_count": 1},
+                {"stat_date": date(2026, 9, 28), "creative_name": "Shared",
+                 "country": "IQ", "regs": 2, "ftd": 0,
+                 "source_type": "фб", "source_name": "рами",
+                 "owner_count": 2, "source_count": 2},
+                {"stat_date": date(2026, 9, 28), "creative_name": "Shared",
+                 "country": "IQ", "regs": 2, "ftd": 0,
+                 "source_type": "ТГ", "source_name": "рами",
+                 "owner_count": 2, "source_count": 2},
+            ]
+
+    class CountryConn(Conn):
+        def __init__(self, columns):
+            self.cursor_obj = CountryCursor(columns)
+
+    conn = CountryConn(COLS)
+    rows = mysql_stats.country_statistics(
+        conn, "5", date(2026, 9, 27), date(2026, 9, 28),
+        country="SA", creative="Crypto", source="ТГ",
+    )
+    assert len(rows) == 2
+    assert rows[0]["country"] == "SA"
+    assert rows[0]["regs"] == 3 and rows[0]["ftd"] == 1
+    assert rows[1]["attribution"] == "ambiguous"
+    assert rows[1]["regs"] is None
+    sql, params = conn.cursor_obj.calls[-1]
+    assert "MAX(COALESCE(count_reg,0))" in sql
+    assert "GROUP BY LEFT(date,10), creo_name, country" in sql
+    assert "SELECT" in sql.upper()
+    assert "INSERT" not in sql.upper()
+    assert params == ["2026-09-27", "2026-09-29", "5",
+                      "2026-09-27", "2026-09-29",
+                      "2026-09-27", "2026-09-29", "ТГ", "SA", "Crypto"]
+    assert "Crypto" not in sql and "'ТГ'" not in sql
+
+
+def test_country_tools_respect_bound_buyer_and_total_before_limit(monkeypatch):
+    class Context:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setattr(mysql_stats, "connection", lambda: Context())
+    monkeypatch.setattr(
+        mysql_stats, "buyer",
+        lambda conn, buyer_id: {"id": buyer_id, "name": "Buyer"},
+    )
+    captured = []
+    def rows(conn, buyer_id, first, last, source=None, country=None, creative=None):
+        captured.append((buyer_id, source, country, creative))
+        if first == date(2026, 9, 27):
+            return [
+                {"stat_date": "2026-09-27", "country": "IQ",
+                 "creative_name": "Old", "source_type": "ТГ",
+                 "source_name": "рами", "regs": 4, "ftd": 1,
+                 "attribution": "exact"},
+            ]
+        return [
+            {"stat_date": "2026-09-28", "country": "SA",
+             "creative_name": "New", "source_type": "ТГ",
+             "source_name": "рами", "regs": 3, "ftd": 1,
+             "attribution": "exact"},
+            {"stat_date": "2026-09-28", "country": "IQ",
+             "creative_name": "Old", "source_type": "ТГ",
+             "source_name": "рами", "regs": 2, "ftd": 0,
+             "attribution": "exact"},
+        ]
+    monkeypatch.setattr(mysql_stats, "country_statistics", rows)
+    analyst = Analyst("5", "Buyer", "key", "model", "https://example.test/v1")
+    result = analyst.call_tool(
+        "get_country_statistics",
+        {"date_from": "2026-09-28", "buyer_id": "other",
+         "source": "ТГ", "group_by": "country", "limit": 1},
+    )
+    assert result["has_data"]
+    assert result["totals"]["regs"] == 5
+    assert result["totals"]["ftd"] == 1
+    assert len(result["rows"]) == 1 and result["truncated"]
+    comparison = analyst.call_tool(
+        "compare_countries",
+        {"first_from": "2026-09-27", "first_to": "2026-09-27",
+         "second_from": "2026-09-28", "second_to": "2026-09-28",
+         "buyer_id": "other"},
+    )
+    assert comparison["has_data"]
+    assert {row["country"] for row in comparison["changes"]} == {"SA", "IQ"}
+    assert all(buyer_id == "5" for buyer_id, *_ in captured)

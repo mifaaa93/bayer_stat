@@ -179,6 +179,31 @@ def test_rate_limit_reserves_group_slot(monkeypatch):
     assert sleeps == [3.0]
 
 
+def test_optional_edit_skips_busy_group_slot_without_waiting(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(bot, "_tg_not_before", {-100: 13.0})
+    monkeypatch.setattr(bot.time, "monotonic", lambda: now[0])
+    waits = []
+    calls = []
+    monkeypatch.setattr(bot.time, "sleep", lambda seconds: waits.append(seconds))
+
+    def edit_message_text(text, chat_id, message_id):
+        calls.append((text, chat_id, message_id))
+        return True
+
+    assert bot.tg_call(
+        edit_message_text, "Данные получены", -100, 123,
+        attempts=1, skip_if_busy=True,
+    ) is None
+    assert waits == [] and calls == []
+    now[0] = 14.0
+    assert bot.tg_call(
+        edit_message_text, "Данные получены", -100, 123,
+        attempts=1, skip_if_busy=True,
+    ) is True
+    assert len(calls) == 1
+
+
 def test_group_handler_does_not_send_typing():
     assert "send_chat_action" not in inspect.getsource(bot.process_question)
     assert bot.bot.message_handlers[0]["function"] is bot.group_message
@@ -654,7 +679,8 @@ def test_followup_queued_during_answer_gets_previous_answer_in_context(monkeypat
         def __init__(self, *_args, **_kwargs):
             pass
 
-        def answer_stream(self, question, on_text, on_status, history):
+        def answer_stream(self, question, on_text, on_status, history,
+                          after_tool_batch=None):
             contexts.append((question, history))
             if question == "вчера":
                 first_started.set()

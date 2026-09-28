@@ -54,6 +54,10 @@ compare_periods или compare_creatives для сравнения и
 find_anomalies для резких изменений, get_data_availability для покрытия дат.
 get_source_statistics для статистики по ТГ/фб и другим источникам,
 compare_sources для сравнения источников и периодов.
+get_country_statistics для регистраций и FTD по странам, креативам и источникам;
+compare_countries для сравнения географии между периодами. Стартов,
+подписок и расходов по странам в страновой таблице нет: не приписывай
+их стране и не вычисляй стоимость/конверсию стартов по стране.
 get_statistics — универсальный
 детальный срез. Можно вызывать несколько инструментов в одном ответе.
 Если нужны независимые данные, сравнения или проверки, верни все нужные
@@ -172,6 +176,24 @@ TOOLS.extend([
           "second_from": DATE, "second_to": DATE,
           "limit": {"type": "integer", "minimum": 1, "maximum": 50}},
          ["first_from", "first_to", "second_from", "second_to"]),
+    tool("get_country_statistics",
+         "Регистрации и FTD по странам, креативам и источникам трафика; стартов по странам нет.",
+         {"date_from": DATE, "date_to": DATE,
+          "country": {"type": "string", "description": "Код страны, например SA"},
+          "creative": {"type": "string", "description": "Точное название креатива"},
+          "source": {"type": "string", "description": "Источник, например ТГ или фб"},
+          "group_by": {"type": "string", "enum": [
+              "country", "creative", "source", "day", "country_creative"
+          ]},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 50}},
+         ["date_from"]),
+    tool("compare_countries",
+         "Сравни регистрации и FTD по странам между двумя периодами; старты по странам недоступны.",
+         {"first_from": DATE, "first_to": DATE,
+          "second_from": DATE, "second_to": DATE,
+          "source": {"type": "string", "description": "ТГ или фб"},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 50}},
+         ["first_from", "first_to", "second_from", "second_to"]),
     tool("find_anomalies",
          "Ищи резкие изменения по креативам между двумя периодами. "
          "Не интерпретируй малые выборки как статистически значимые.",
@@ -197,6 +219,8 @@ TOOL_PROGRESS = {
     "get_data_availability": "Проверяю доступные данные",
     "get_source_statistics": "Сравниваю источники",
     "compare_sources": "Сравниваю источники и группы",
+    "get_country_statistics": "Изучаю страны",
+    "compare_countries": "Сравниваю страны",
 }
 
 
@@ -328,8 +352,8 @@ class Analyst:
             return {"error": "Неизвестный инструмент"}
         today = datetime.now(TIMEZONE).date()
         try:
-            first, last = period(args, today, "first_from", "first_to") if name in ("compare_periods", "find_anomalies", "compare_sources") else period(args, today)
-            if name in ("compare_periods", "find_anomalies", "compare_sources"):
+            first, last = period(args, today, "first_from", "first_to") if name in ("compare_periods", "find_anomalies", "compare_sources", "compare_countries") else period(args, today)
+            if name in ("compare_periods", "find_anomalies", "compare_sources", "compare_countries"):
                 second_first, second_last = period(args, today, "second_from", "second_to")
         except ValueError as exc:
             return {"error": str(exc)}
@@ -442,6 +466,138 @@ class Analyst:
                             "Сравнение групп выполняется по креативам со стартами > 0. "
                             "Источник событий может быть неоднозначным, если один "
                             "креатив в одну дату использовался в нескольких источниках."
+                        ),
+                    }
+                if name == "get_country_statistics":
+                    rows = mysql_stats.country_statistics(
+                        conn, self.buyer_id, first, last,
+                        source=args.get("source"),
+                        country=args.get("country"),
+                        creative=args.get("creative"),
+                    )
+                    exact = [row for row in rows if row["attribution"] == "exact"]
+                    group_by = args.get("group_by", "country")
+                    groups = {}
+                    for row in exact:
+                        if group_by == "creative":
+                            key = row["creative_name"]
+                        elif group_by == "source":
+                            key = f"{row['source_type']}|{row['source_name']}"
+                        elif group_by == "day":
+                            key = row["stat_date"]
+                        elif group_by == "country_creative":
+                            key = f"{row['country']}|{row['creative_name']}"
+                        else:
+                            key = row["country"]
+                        target = groups.setdefault(key, {
+                            "key": key, "regs": 0, "ftd": 0,
+                            "source_types": set(), "countries": set(),
+                            "creatives": set(), "dates": set(),
+                        })
+                        target["regs"] += row["regs"] or 0
+                        target["ftd"] += row["ftd"] or 0
+                        target["source_types"].add(row["source_type"])
+                        target["countries"].add(row["country"])
+                        target["creatives"].add(row["creative_name"])
+                        target["dates"].add(row["stat_date"])
+                    limit = max(1, min(int(args.get("limit", 25)), 50))
+                    items = sorted(groups.values(), key=lambda item: item["regs"], reverse=True)
+                    totals = {
+                        "regs": sum(row["regs"] or 0 for row in exact),
+                        "ftd": sum(row["ftd"] or 0 for row in exact),
+                    }
+                    totals["conversion_regs_to_ftd"] = (
+                        round(totals["ftd"] / totals["regs"], 4)
+                        if totals["regs"] else None
+                    )
+                    for item in items:
+                        for field in ("source_types", "countries", "creatives", "dates"):
+                            item[field] = sorted(item[field])
+                        item["conversion_regs_to_ftd"] = (
+                            round(item["ftd"] / item["regs"], 4)
+                            if item["regs"] else None
+                        )
+                    return {
+                        **result, "has_data": bool(items),
+                        "group_by": group_by, "rows": items[:limit],
+                        "totals": totals,
+                        "matching_rows": len(items), "truncated": len(items) > limit,
+                        "ambiguous_rows": len(rows) - len(exact),
+                        "available_dates": sorted({row["stat_date"] for row in exact}),
+                        "note": (
+                            "Нераспределённые строки исключены из группировки. "
+                            "Доступны только регистрации и FTD по странам: "
+                            "стартов, подписок и расходов по странам в источнике нет. "
+                            "Страновые данные могут покрывать лишь часть всех событий."
+                        ),
+                    }
+                if name == "compare_countries":
+                    first_rows = mysql_stats.country_statistics(
+                        conn, self.buyer_id, first, last, source=args.get("source")
+                    )
+                    second_rows = mysql_stats.country_statistics(
+                        conn, self.buyer_id, second_first, second_last,
+                        source=args.get("source"),
+                    )
+                    def country_totals(rows):
+                        out = {}
+                        for row in rows:
+                            if row["attribution"] != "exact":
+                                continue
+                            item = out.setdefault(row["country"], {"regs": 0, "ftd": 0})
+                            item["regs"] += row["regs"] or 0
+                            item["ftd"] += row["ftd"] or 0
+                        return out
+                    first_countries, second_countries = (
+                        country_totals(first_rows), country_totals(second_rows)
+                    )
+                    limit = max(1, min(int(args.get("limit", 25)), 50))
+                    changes = []
+                    for country in first_countries.keys() | second_countries.keys():
+                        before = first_countries.get(country, {"regs": 0, "ftd": 0})
+                        after = second_countries.get(country, {"regs": 0, "ftd": 0})
+                        changes.append({
+                            "country": country, "first": before, "second": after,
+                            "regs_difference": after["regs"] - before["regs"],
+                            "ftd_difference": after["ftd"] - before["ftd"],
+                            "new": country not in first_countries,
+                            "stopped": country not in second_countries,
+                        })
+                    changes.sort(
+                        key=lambda item: abs(item["regs_difference"]) +
+                        abs(item["ftd_difference"]) * 3,
+                        reverse=True,
+                    )
+                    return {
+                        **result, "has_data": bool(changes), "changes": changes[:limit],
+                        "truncated": len(changes) > limit,
+                        "first_period": {
+                            "from": str(first), "to": str(last),
+                            "available_dates": sorted({
+                                row["stat_date"] for row in first_rows
+                                if row["attribution"] == "exact"
+                            }),
+                        },
+                        "second_period": {
+                            "from": str(second_first), "to": str(second_last),
+                            "available_dates": sorted({
+                                row["stat_date"] for row in second_rows
+                                if row["attribution"] == "exact"
+                            }),
+                        },
+                        "ambiguous_rows": (
+                            len(first_rows) - sum(
+                                row["attribution"] == "exact" for row in first_rows
+                            )
+                            + len(second_rows) - sum(
+                                row["attribution"] == "exact" for row in second_rows
+                            )
+                        ),
+                        "note": (
+                            "Сравниваются только регистрации и FTD по странам "
+                            "из страновой таблицы. Стартов и расходов по странам "
+                            "нет; отсутствие страны в периоде может означать "
+                            "отсутствие данных, а не нулевую активность."
                         ),
                     }
                 if name == "get_data_availability":
@@ -682,6 +838,7 @@ class Analyst:
     def _run_tools(
         self, messages: list[dict],
         on_status: Callable[[str], None] | None = None,
+        after_tool_batch: Callable[[], None] | None = None,
     ) -> tuple[list[dict], bool, bool, str]:
         """Returns messages, has_data, tools_used, direct_reply."""
         has_data = False
@@ -736,6 +893,11 @@ class Analyst:
                                  "content": json.dumps(result, ensure_ascii=False)})
                 if on_status:
                     on_status("Сверяю результаты")
+            # All tool results from this round are now in `messages`.
+            # The caller may update the Telegram status once, without making
+            # any additional AI request or waiting for a Telegram edit slot.
+            if after_tool_batch:
+                after_tool_batch()
         log.warning(
             "Tool call round limit reached (%s); answering with collected data "
             "buyer_id=%s buyer=%s has_data=%s",
@@ -750,7 +912,7 @@ class Analyst:
         return text
 
     def answer_stream(self, question: str, on_text=None, on_status=None,
-                      history=None) -> str:
+                      history=None, after_tool_batch=None) -> str:
         """Compatibility name; final generation is deliberately non-streaming."""
         started = time.monotonic()
         history_len = len(history or [])
@@ -759,7 +921,7 @@ class Analyst:
             self.buyer_id, self.buyer_name, history_len, _preview(question),
         )
         messages, has_data, tools_used, direct = self._run_tools(
-            self._messages(question, history), on_status
+            self._messages(question, history), on_status, after_tool_batch
         )
         if not has_data:
             if not tools_used:
