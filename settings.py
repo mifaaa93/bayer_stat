@@ -18,6 +18,7 @@ SERVICE_TIER = os.getenv("OPENAI_SERVICE_TIER", "").strip() or None
 TRANSCRIPTION_MODEL = os.getenv("TRANSCRIPTION_MODEL", "gpt-4o-transcribe")
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 TRANSCRIPTION_QUEUE_SIZE = max(1, int(os.getenv("TRANSCRIPTION_QUEUE_SIZE", "50")))
+TRANSCRIPTION_WORKERS = max(1, int(os.getenv("TRANSCRIPTION_WORKERS", "2")))
 TIMEZONE = timezone(timedelta(hours=2))
 
 _LOGGING_CONFIGURED = False

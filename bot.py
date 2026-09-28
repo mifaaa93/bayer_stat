@@ -32,6 +32,7 @@ from settings import (
     FFMPEG_BIN,
     TRANSCRIPTION_MODEL,
     TRANSCRIPTION_QUEUE_SIZE,
+    TRANSCRIPTION_WORKERS,
 )
 from voice_transcription import VoiceTranscriber
 
@@ -893,11 +894,14 @@ def start_transcription_worker() -> None:
     if voice_worker_started:
         return
     voice_worker_started = True
-    threading.Thread(
-        target=transcription_worker,
-        name="voice-transcription",
-        daemon=True,
-    ).start()
+    for index in range(TRANSCRIPTION_WORKERS):
+        threading.Thread(
+            target=transcription_worker,
+            name=f"voice-transcription-{index + 1}",
+            daemon=True,
+        ).start()
+    log.info("Started voice transcription workers=%s queue_size=%s",
+             TRANSCRIPTION_WORKERS, TRANSCRIPTION_QUEUE_SIZE)
 
 
 def process_question_queue(chat_id: int) -> None:
