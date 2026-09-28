@@ -52,6 +52,8 @@ SYSTEM = """Ты аналитик TGAds. Сегодня {today}, часовой 
 get_creative для одного креатива, list_creatives для рейтинга или поиска,
 compare_periods или compare_creatives для сравнения и
 find_anomalies для резких изменений, get_data_availability для покрытия дат.
+get_source_statistics для статистики по ТГ/фб и другим источникам,
+compare_sources для сравнения источников и периодов.
 get_statistics — универсальный
 детальный срез. Можно вызывать несколько инструментов в одном ответе.
 Если нужны независимые данные, сравнения или проверки, верни все нужные
@@ -157,6 +159,19 @@ TOOLS.extend([
     tool("get_data_availability",
          "Покрытие дат и заполненность затрат байера в MySQL; когда данных нет или затраты пусты.",
          {"date_from": DATE, "date_to": DATE}, ["date_from"]),
+    tool("get_source_statistics",
+         "Статистика по источникам трафика (например ТГ, фб), группам/креативам и датам.",
+         {"date_from": DATE, "date_to": DATE,
+          "source": {"type": "string", "description": "Например ТГ или фб"},
+          "by_day": {"type": "boolean"},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 50}},
+         ["date_from"]),
+    tool("compare_sources",
+         "Сравни источники и группы/креативы между двумя периодами; покажи новые и исчезнувшие группы.",
+         {"first_from": DATE, "first_to": DATE,
+          "second_from": DATE, "second_to": DATE,
+          "limit": {"type": "integer", "minimum": 1, "maximum": 50}},
+         ["first_from", "first_to", "second_from", "second_to"]),
     tool("find_anomalies",
          "Ищи резкие изменения по креативам между двумя периодами. "
          "Не интерпретируй малые выборки как статистически значимые.",
@@ -180,6 +195,8 @@ TOOL_PROGRESS = {
     "compare_creatives": "Сравниваю креативы",
     "find_anomalies": "Проверяю изменения",
     "get_data_availability": "Проверяю доступные данные",
+    "get_source_statistics": "Сравниваю источники",
+    "compare_sources": "Сравниваю источники и группы",
 }
 
 
@@ -232,6 +249,50 @@ def aggregate_creatives(rows: list[dict], by_date: bool = False) -> list[dict]:
     return result
 
 
+def aggregate_sources(rows: list[dict], by_day: bool = False) -> list[dict]:
+    grouped: dict[tuple, list[dict]] = {}
+    for row in rows:
+        key = (
+            row["source_type"],
+            row["source_name"],
+            row["stat_date"] if by_day else None,
+        )
+        grouped.setdefault(key, []).append(row)
+    result = []
+    for (source_type, source_name, day), parts in grouped.items():
+        result.append({
+            "source_type": source_type,
+            "source_name": source_name,
+            **({"date": day} if by_day else {}),
+            "totals": funnel(summarize(parts)),
+            "creative_count": len({row["creative_name"] for row in parts}),
+            "unattributed_event_rows": sum(
+                row["attribution"] != "exact" for row in parts
+            ),
+        })
+    return result
+
+
+def source_creative_rows(rows: list[dict]) -> dict[tuple, dict]:
+    result = {}
+    for row in rows:
+        key = (row["source_type"], row["source_name"], row["creative_name"])
+        item = result.setdefault(key, {
+            "source_type": row["source_type"],
+            "source_name": row["source_name"],
+            "creative_name": row["creative_name"],
+            **{metric: 0 for metric in METRICS},
+            "spend_incomplete": False,
+        })
+        item["spend_incomplete"] |= bool(row.get("spend_missing"))
+        for metric in METRICS:
+            item[metric] += float(row[metric] or 0)
+    for item in result.values():
+        if item["spend_incomplete"]:
+            item["spend"] = None
+    return result
+
+
 def period(args: dict, today: date, from_key: str = "date_from",
            to_key: str = "date_to") -> tuple[date, date]:
     try:
@@ -267,8 +328,8 @@ class Analyst:
             return {"error": "Неизвестный инструмент"}
         today = datetime.now(TIMEZONE).date()
         try:
-            first, last = period(args, today, "first_from", "first_to") if name in ("compare_periods", "find_anomalies") else period(args, today)
-            if name in ("compare_periods", "find_anomalies"):
+            first, last = period(args, today, "first_from", "first_to") if name in ("compare_periods", "find_anomalies", "compare_sources") else period(args, today)
+            if name in ("compare_periods", "find_anomalies", "compare_sources"):
                 second_first, second_last = period(args, today, "second_from", "second_to")
         except ValueError as exc:
             return {"error": str(exc)}
@@ -282,6 +343,107 @@ class Analyst:
                 if not current:
                     return {"error": "Привязанный байер больше не найден в traffers"}
                 result["buyer"] = current["name"]
+                if name in ("get_source_statistics", "compare_sources"):
+                    if name == "get_source_statistics":
+                        source_result = mysql_stats.source_statistics(
+                            conn, self.buyer_id, first, last, args.get("source")
+                        )
+                        rows = source_result["rows"]
+                        if args.get("source"):
+                            requested = str(args["source"]).casefold()
+                            rows = [
+                                row for row in rows
+                                if requested in row["source_type"].casefold()
+                                or requested in row["source_name"].casefold()
+                            ]
+                        source_totals = aggregate_sources(rows, bool(args.get("by_day")))
+                        limit = max(1, min(int(args.get("limit", 20)), 50))
+                        creative_groups = sorted(
+                            source_creative_rows(rows).values(),
+                            key=lambda item: item["starts"] if item["starts"] is not None else -1,
+                            reverse=True,
+                        )
+                        return {
+                            **result,
+                            "has_data": bool(rows),
+                            "sources": [
+                                {"source_type": source_type, "source_name": source_name}
+                                for source_type, source_name in sorted({
+                                    (row["source_type"], row["source_name"])
+                                    for row in rows
+                                })
+                            ],
+                            "source_totals": source_totals,
+                            "top_creatives": creative_groups[:limit],
+                            "creative_count": len(creative_groups),
+                            "truncated": len(creative_groups) > limit,
+                            "unattributed_events": source_result["unattributed_events"],
+                            "source_mapping": source_result["source_mapping"],
+                            "note": (
+                                "Старты относятся к источнику только если креатив "
+                                "и дата однозначно связаны с одним источником. "
+                                "Неоднозначные события вынесены отдельно."
+                            ),
+                        }
+                    first_source = mysql_stats.source_statistics(
+                        conn, self.buyer_id, first, last
+                    )
+                    second_source = mysql_stats.source_statistics(
+                        conn, self.buyer_id, second_first, second_last
+                    )
+                    first_rows = source_creative_rows(first_source["rows"])
+                    second_rows = source_creative_rows(second_source["rows"])
+                    sources = sorted({
+                        (key[0], key[1]) for key in first_rows | second_rows
+                    })
+                    source_changes = []
+                    for source_type, source_name in sources:
+                        first_parts = [
+                            item for key, item in first_rows.items()
+                            if key[:2] == (source_type, source_name)
+                        ]
+                        second_parts = [
+                            item for key, item in second_rows.items()
+                            if key[:2] == (source_type, source_name)
+                        ]
+                        first_total = summarize(first_parts)
+                        second_total = summarize(second_parts)
+                        first_groups = {
+                            item["creative_name"] for item in first_parts
+                            if item["starts"] > 0
+                        }
+                        second_groups = {
+                            item["creative_name"] for item in second_parts
+                            if item["starts"] > 0
+                        }
+                        source_changes.append({
+                            "source_type": source_type,
+                            "source_name": source_name,
+                            "first": first_total,
+                            "second": second_total,
+                            "starts_difference": (
+                                second_total["starts"] - first_total["starts"]
+                            ),
+                            "new_creatives": sorted(second_groups - first_groups)[:50],
+                            "stopped_creatives": sorted(first_groups - second_groups)[:50],
+                            "new_count": len(second_groups - first_groups),
+                            "stopped_count": len(first_groups - second_groups),
+                        })
+                    return {
+                        **result,
+                        "has_data": bool(source_changes),
+                        "sources": source_changes,
+                        "unattributed_events": (
+                            first_source["unattributed_events"]
+                            + second_source["unattributed_events"]
+                        ),
+                        "source_mapping": first_source["source_mapping"],
+                        "note": (
+                            "Сравнение групп выполняется по креативам со стартами > 0. "
+                            "Источник событий может быть неоднозначным, если один "
+                            "креатив в одну дату использовался в нескольких источниках."
+                        ),
+                    }
                 if name == "get_data_availability":
                     dates = mysql_stats.availability(conn, self.buyer_id, first, last)
                     return {

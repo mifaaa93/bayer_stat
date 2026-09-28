@@ -231,3 +231,141 @@ def availability(conn, buyer_id: str, first: date, last: date) -> list[dict]:
             }
             for row in cursor.fetchall()
         ]
+
+
+def _columns_for(conn, table: str) -> set[str]:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
+            (os.environ["MYSQL_DATABASE"], table),
+        )
+        columns = {row["COLUMN_NAME"] for row in cursor.fetchall()}
+    if not columns:
+        raise ValueError(f"Таблица MySQL {table} не найдена или недоступна")
+    return columns
+
+
+def source_statistics(
+    conn, buyer_id: str, first: date, last: date, source: str | None = None
+) -> dict:
+    """Return source-tagged spend and safely attributable funnel metrics.
+
+    Events table has no id_blog in the current schema. Events are attributed
+    to a source only when a creative/date maps to exactly one source in creos.
+    Ambiguous event rows are returned separately instead of being duplicated.
+    """
+    cols = discover(conn)
+    blogger_cols = _columns_for(conn, "bloggers")
+    blog_id = quoted(pick(blogger_cols, ("id",), "bloggers"))
+    blog_type = quoted(pick(blogger_cols, ("traf_type",), "bloggers"))
+    blog_name = quoted(
+        pick(blogger_cols, ("blogger_name", "blogger"), "bloggers")
+    )
+    q = lambda key: quoted(cols[key])
+    from datetime import timedelta
+
+    end = last + timedelta(days=1)
+    source_filter = "AND b.traf_type=%s" if source else ""
+    source_query = f"""
+        SELECT DATE(c.{q("creo_date")}) AS stat_date,
+               c.{q("creo_name")} AS creative_name,
+               c.id_blog AS source_id,
+               COALESCE(b.{blog_type}, 'unknown') AS source_type,
+               COALESCE(b.{blog_name}, c.id_blog) AS source_name,
+               SUM(CAST(NULLIF(TRIM(c.{q("creo_spend")}), '') AS DECIMAL(20,8))) AS spend,
+               SUM(c.{q("creo_spend")} IS NULL OR TRIM(c.{q("creo_spend")})='') AS missing_spend_rows
+        FROM creos c
+        LEFT JOIN bloggers b ON b.{blog_id}=c.id_blog
+        WHERE c.{q("creo_buyer")}=%s
+          AND c.{q("creo_date")} >= %s AND c.{q("creo_date")} < %s
+          {source_filter}
+        GROUP BY DATE(c.{q("creo_date")}), c.{q("creo_name")},
+                 c.id_blog, b.{blog_type}, b.{blog_name}
+        ORDER BY stat_date, source_type, creative_name
+    """
+    events_query = f"""
+        SELECT DATE({q("stats_date")}) AS stat_date,
+               {q("stats_name")} AS creative_name,
+               SUM(COALESCE({q("starts")},0)) AS starts,
+               SUM(COALESCE({q("subs")},0)) AS subs,
+               SUM(COALESCE({q("regs")},0)) AS regs,
+               SUM(COALESCE({q("ftd")},0)) AS ftd
+        FROM buyer_stats_today_start_sub
+        WHERE {q("stats_date")} >= %s AND {q("stats_date")} < %s
+        GROUP BY DATE({q("stats_date")}), {q("stats_name")}
+    """
+    with conn.cursor() as cursor:
+        source_params = [buyer_id, first, end]
+        if source:
+            source_params.append(source)
+        cursor.execute(source_query, source_params)
+        source_rows = cursor.fetchall()
+        # Events have no buyer/source ID. For each creative/date, determine
+        # whether the same name is also used by another buyer or source.
+        cursor.execute(
+            f"""SELECT DATE({q("creo_date")}) AS stat_date,
+                       {q("creo_name")} AS creative_name,
+                       COUNT(DISTINCT {q("creo_buyer")}) AS buyer_count,
+                       COUNT(DISTINCT id_blog) AS source_count
+                FROM creos
+                WHERE {q("creo_date")} >= %s AND {q("creo_date")} < %s
+                GROUP BY DATE({q("creo_date")}), {q("creo_name")}""",
+            (first, end),
+        )
+        ownership = {
+            (str(row["stat_date"]), row["creative_name"]):
+            (int(row["buyer_count"]), int(row["source_count"]))
+            for row in cursor.fetchall()
+        }
+        cursor.execute(events_query, (first, end))
+        event_rows = {
+            (str(row["stat_date"]), row["creative_name"]): row
+            for row in cursor.fetchall()
+        }
+
+    source_keys: dict[tuple, set[str]] = {}
+    for row in source_rows:
+        key = (str(row["stat_date"]), row["creative_name"])
+        source_keys.setdefault(key, set()).add(str(row["source_id"]))
+
+    rows = []
+    unattributed = []
+    ambiguous_keys: set[tuple[str, str]] = set()
+    for row in source_rows:
+        key = (str(row["stat_date"]), row["creative_name"])
+        event = event_rows.get(key)
+        buyers_count, sources_count = ownership.get(key, (0, 0))
+        exact = (
+            len(source_keys[key]) == 1
+            and buyers_count == 1
+            and sources_count == 1
+        )
+        item = {
+            "stat_date": key[0],
+            "creative_name": row["creative_name"],
+            "source_id": str(row["source_id"]),
+            "source_type": str(row["source_type"]),
+            "source_name": str(row["source_name"]),
+            "spend": _number(row["spend"]),
+            "spend_missing": bool(row["missing_spend_rows"]),
+            "attribution": "exact" if exact else "ambiguous",
+        }
+        for metric in ("starts", "subs", "regs", "ftd"):
+            item[metric] = _number(event[metric]) if exact and event else None
+        rows.append(item)
+        if event and not exact and key not in ambiguous_keys:
+            ambiguous_keys.add(key)
+            unattributed.append({
+                "stat_date": key[0],
+                "creative_name": row["creative_name"],
+                **{metric: _number(event[metric]) for metric in
+                   ("starts", "subs", "regs", "ftd")},
+                "reason": "creative/date используются несколькими источниками или байерами",
+            })
+    return {
+        "rows": rows,
+        "unattributed_events": unattributed,
+        "source_types": sorted({row["source_type"] for row in rows}),
+        "source_mapping": "exact for unique creative/date; ambiguous events are not duplicated",
+    }

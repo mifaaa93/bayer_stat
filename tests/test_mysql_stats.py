@@ -226,7 +226,7 @@ def test_all_ai_tools_belong_to_bound_buyer(monkeypatch):
 
 def test_tool_schemas_are_unique_and_do_not_expose_buyer_selection():
     names = [item["function"]["name"] for item in TOOLS]
-    assert len(names) == len(set(names)) == 9
+    assert len(names) == len(set(names)) == 11
     assert {"get_creative", "compare_periods", "get_funnel",
             "get_data_availability", "find_anomalies"} <= set(names)
     for tool in TOOLS:
