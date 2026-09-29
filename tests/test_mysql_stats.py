@@ -61,7 +61,7 @@ def test_statistics_uses_bound_buyer_and_daily_dates(monkeypatch):
     rows = mysql_stats.statistics(conn, "5", date(2026, 9, 25), date(2026, 9, 26))
     assert rows[0]["stat_date"] == "2026-09-26"
     assert conn.cursor_obj.params == [
-        "5", date(2026, 9, 25), date(2026, 9, 27),
+        date(2026, 9, 25), date(2026, 9, 27), "5",
         date(2026, 9, 25), date(2026, 9, 27)
     ]
     assert "GROUP BY" in conn.cursor_obj.last
@@ -224,15 +224,201 @@ def test_all_ai_tools_belong_to_bound_buyer(monkeypatch):
     assert all(buyer_id == "5" for buyer_id, _, _ in queries)
 
 
-def test_tool_schemas_are_unique_and_do_not_expose_buyer_selection():
+def test_tool_schemas_are_unique_and_scope_buyer_selection():
     names = [item["function"]["name"] for item in TOOLS]
-    assert len(names) == len(set(names)) == 13
+    assert len(names) == len(set(names)) == 16
     assert {"get_creative", "compare_periods", "get_funnel",
-            "get_data_availability", "find_anomalies"} <= set(names)
+            "get_data_availability", "find_anomalies",
+            "list_available_buyers", "get_buyer_statistics",
+            "compare_buyers"} <= set(names)
+    legacy_tools = {
+        "get_statistics", "get_overview", "get_funnel", "get_creative",
+        "list_creatives", "compare_periods", "compare_creatives",
+        "get_data_availability", "get_source_statistics", "compare_sources",
+        "get_country_statistics", "compare_countries", "find_anomalies",
+    }
     for tool in TOOLS:
         parameters = tool["function"]["parameters"]
-        assert "buyer_id" not in parameters["properties"]
+        if tool["function"]["name"] in legacy_tools:
+            assert "buyer_id" not in parameters["properties"]
         assert parameters["additionalProperties"] is False
+    assert "buyer_id" in next(
+        item["function"]["parameters"]["properties"]
+        for item in TOOLS
+        if item["function"]["name"] == "get_buyer_statistics"
+    )
+
+
+def test_global_scope_can_select_one_buyer(monkeypatch):
+    class Context:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setattr(mysql_stats, "connection", lambda: Context())
+    monkeypatch.setattr(mysql_stats, "buyer", lambda conn, buyer_id: (
+        {"id": str(buyer_id), "name": "Анастасия", "status": "Работает"}
+        if str(buyer_id) == "5" else None
+    ))
+    monkeypatch.setattr(mysql_stats, "statistics", lambda *args, **kwargs: [
+        {"stat_date": "2026-09-29", "creative_name": "A", "spend": 10,
+         "spend_missing": False, "starts": 20, "subs": 5, "regs": 2, "ftd": 1},
+    ])
+    model = Analyst("*", "Все байеры", "key", "model", "https://example.test/v1")
+    result = model.call_tool("get_buyer_statistics", {
+        "date_from": "2026-09-29", "buyer_id": "5",
+    })
+    assert result["selected_buyer"]["name"] == "Анастасия"
+    assert result["totals"]["starts"] == 20
+
+
+def test_global_scope_prompt_contains_full_buyer_list(monkeypatch):
+    class Context:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setattr(mysql_stats, "connection", lambda: Context())
+    monkeypatch.setattr(mysql_stats, "buyer_list", lambda conn: [
+        {"id": "5", "name": "Анастасия", "status": "Работает"},
+        {"id": "6", "name": "Иван", "status": "Пауза"},
+    ])
+    model = Analyst("*", "Все байеры", "key", "model", "https://example.test/v1")
+    messages = model._messages("статистика Анастасии")
+    assert '"id": "5"' in messages[1]["content"]
+    assert '"id": "6"' in messages[1]["content"]
+    assert messages[-1]["content"] == "статистика Анастасии"
+    assert "buyer_name" not in next(
+        item["function"]["parameters"]["properties"]
+        for item in model._tools()
+        if item["function"]["name"] == "get_buyer_statistics"
+    )
+    assert all(
+        item["function"]["name"] not in {"list_available_buyers",
+                                          "get_buyer_statistics", "compare_buyers"}
+        for item in Analyst("5", "Buyer", "key", "model",
+                            "https://example.test/v1")._tools()
+    )
+
+
+def test_global_question_can_use_model_selected_id_from_full_list(monkeypatch):
+    class Context:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setattr(mysql_stats, "connection", lambda: Context())
+    monkeypatch.setattr(mysql_stats, "buyer_list", lambda conn: [
+        {"id": "5", "name": "NEW_Anastacia", "status": "Работает"},
+        {"id": "6", "name": "NEW_Dima", "status": "Пауза"},
+    ])
+    monkeypatch.setattr(mysql_stats, "buyer", lambda conn, buyer_id: (
+        {"id": "5", "name": "NEW_Anastacia", "status": "Работает"}
+        if buyer_id == "5" else None
+    ))
+    called = []
+    def stats(conn, buyer_id, first, last, **kwargs):
+        called.append(buyer_id)
+        return [{
+            "stat_date": "2026-09-29", "creative_name": "A", "spend": 10,
+            "spend_missing": False, "starts": 12, "subs": 3, "regs": 1, "ftd": 0,
+        }]
+    monkeypatch.setattr(mysql_stats, "statistics", stats)
+    analyst = Analyst("*", "Все байеры", "key", "model", "https://example.test/v1")
+    first = Mock()
+    first.json.return_value = {
+        "choices": [{"message": {
+            "content": None, "tool_calls": [{
+                "id": "call-1", "function": {
+                    "name": "get_buyer_statistics",
+                    "arguments": '{"date_from":"2026-09-29","buyer_id":"5"}',
+                },
+            }],
+        }}],
+    }
+    final = Mock()
+    final.json.return_value = {
+        "choices": [{"message": {"content": "Данные Анастасии", "tool_calls": []}}],
+    }
+    with patch.object(analyst, "_request", side_effect=[first, final]) as request:
+        messages, has_data, used, direct = analyst._run_tools(
+            analyst._messages("Покажи статистику Анастасии сегодня")
+        )
+    assert "NEW_Anastacia" in request.call_args_list[0].args[0][1]["content"]
+    assert has_data and used and direct == "Данные Анастасии"
+    assert called == ["5"]
+    assert '"buyer": "NEW_Anastacia"' in messages[-1]["content"]
+
+
+def test_global_buyer_name_argument_does_not_silently_return_all_buyers():
+    model = Analyst("*", "Все байеры", "key", "model", "https://example.test/v1")
+    result = model.call_tool("get_overview", {
+        "date_from": "2026-09-29", "buyer_name": "Анастасия",
+    })
+    assert "error" in result
+    assert "has_data" not in result
+
+
+def test_global_scope_rejects_unknown_buyer_id(monkeypatch):
+    class Context:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setattr(mysql_stats, "connection", lambda: Context())
+    monkeypatch.setattr(mysql_stats, "buyer", lambda conn, buyer_id: None)
+    model = Analyst("*", "Все байеры", "key", "model", "https://example.test/v1")
+    result = model.call_tool("get_buyer_statistics", {
+        "date_from": "2026-09-29", "buyer_id": "999",
+    })
+    assert "error" in result
+
+
+def test_global_scope_can_compare_buyers(monkeypatch):
+    class Context:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setattr(mysql_stats, "connection", lambda: Context())
+    names = {"5": "Анастасия", "6": "Иван"}
+    monkeypatch.setattr(mysql_stats, "buyer", lambda conn, buyer_id: {
+        "id": str(buyer_id), "name": names[str(buyer_id)], "status": "Работает",
+    })
+    monkeypatch.setattr(mysql_stats, "statistics", lambda conn, buyer_id, first, last,
+                        **kwargs: [{
+                            "stat_date": "2026-09-29", "creative_name": str(buyer_id),
+                            "spend": 10, "spend_missing": False,
+                            "starts": int(buyer_id), "subs": 1, "regs": 1, "ftd": 0,
+                        }])
+    model = Analyst("*", "Все байеры", "key", "model", "https://example.test/v1")
+    result = model.call_tool("compare_buyers", {
+        "date_from": "2026-09-29", "buyer_ids": ["5", "6"],
+    })
+    assert result["has_data"]
+    assert [item["buyer"]["id"] for item in result["buyers"]] == ["5", "6"]
+
+
+def test_single_scope_cannot_select_or_compare_other_buyers(monkeypatch):
+    model = Analyst("5", "Анастасия", "key", "model", "https://example.test/v1")
+    selected = model.call_tool("get_buyer_statistics", {
+        "date_from": "2026-09-29", "buyer_id": "6",
+    })
+    compared = model.call_tool("compare_buyers", {
+        "date_from": "2026-09-29", "buyer_ids": ["5", "6"],
+    })
+    assert "только привязанный" in selected["error"]
+    assert "только привязанный" in compared["error"]
 
 
 def test_tool_request_enables_parallel_calls():

@@ -58,6 +58,10 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE group_bindings ADD COLUMN topic_title TEXT NOT NULL DEFAULT 'General — вся группа'"
         )
+    if "buyer_scope" not in columns:
+        conn.execute(
+            "ALTER TABLE group_bindings ADD COLUMN buyer_scope TEXT NOT NULL DEFAULT 'single'"
+        )
     if "is_forum" not in columns:
         conn.execute(
             "ALTER TABLE group_bindings ADD COLUMN is_forum INTEGER NOT NULL DEFAULT 0"
@@ -107,23 +111,25 @@ def bind_group(conn: sqlite3.Connection, chat_id: int, title: str,
                username: str | None, buyer_id: str, buyer_name: str,
                topic_id: int | None = None,
                topic_title: str = "General — вся группа",
-               is_forum: bool | None = None) -> None:
+               is_forum: bool | None = None,
+               buyer_scope: str = "single") -> None:
     forum = bool(topic_id is not None) if is_forum is None else bool(is_forum)
     with conn:
         conn.execute(
             """
             INSERT INTO group_bindings(
                 chat_id,title,username,buyer_id,buyer_name,added_at_utc,
-                topic_id,topic_title,is_forum
-            ) VALUES(?,?,?,?,?,?,?,?,?)
+                topic_id,topic_title,is_forum,buyer_scope
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(chat_id) DO UPDATE SET
                 title=excluded.title, username=excluded.username,
                 buyer_id=excluded.buyer_id, buyer_name=excluded.buyer_name,
                 topic_id=excluded.topic_id, topic_title=excluded.topic_title,
-                is_forum=excluded.is_forum
+                is_forum=excluded.is_forum, buyer_scope=excluded.buyer_scope
             """,
             (chat_id, title, username, buyer_id, buyer_name,
-             datetime.now(timezone.utc).isoformat(), topic_id, topic_title, int(forum)),
+             datetime.now(timezone.utc).isoformat(), topic_id, topic_title,
+             int(forum), buyer_scope),
         )
         conn.execute("DELETE FROM group_messages WHERE chat_id=?", (chat_id,))
 

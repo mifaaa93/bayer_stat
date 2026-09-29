@@ -204,6 +204,21 @@ def buyer_label(buyer: dict) -> str:
     return f"{buyer['name']} ({buyer['status'].strip().lower()})"
 
 
+GLOBAL_BUYER = {
+    "id": "*",
+    "name": "Все байеры",
+    "status": "общая статистика",
+}
+
+
+def is_global_buyer(buyer: dict) -> bool:
+    return buyer.get("buyer_scope") == "all" or buyer.get("buyer_id") == "*"
+
+
+def buyer_display(buyer: dict) -> str:
+    return "🌐 Общая статистика (все байеры)" if buyer.get("id") == "*" else buyer_label(buyer)
+
+
 def topic_label(title: str | None, topic_id: int | None = None) -> str:
     title = title or ALL_TOPICS
     if title.startswith("Тема #"):
@@ -228,7 +243,9 @@ def show_buyers(chat_id: int, user_id: int, message_id: int) -> None:
     with state_lock:
         if user_id not in pending:
             return
-        pending[user_id]["buyers"] = {b["id"]: b for b in options}
+        pending[user_id]["buyers"] = {
+            b["id"]: b for b in [GLOBAL_BUYER, *options]
+        }
         pending[user_id]["stage"] = "choose"
         pending[user_id]["message_id"] = message_id
         title = pending[user_id]["title"]
@@ -237,9 +254,10 @@ def show_buyers(chat_id: int, user_id: int, message_id: int) -> None:
             pending[user_id].get("topic_id"),
         )
     kb = types.InlineKeyboardMarkup(row_width=1)
+    options = [GLOBAL_BUYER, *options]
     for buyer in options[:80]:
         kb.add(types.InlineKeyboardButton(
-            buyer_label(buyer)[:60], callback_data=f"pick:{buyer['id']}"
+            buyer_display(buyer)[:60], callback_data=f"pick:{buyer['id']}"
         ))
     with state_lock:
         changing = pending[user_id].get("mode") == "change_buyer"
@@ -404,13 +422,16 @@ def group_card(chat_id: int, group_id: int, page: int, message_id: int):
     if not group:
         group_list(chat_id, page, message_id)
         return
-    try:
-        with mysql_stats.connection() as mysql:
-            current = mysql_stats.buyer(mysql, group["buyer_id"])
-    except Exception:
-        log.warning("Could not refresh buyer status in group card", exc_info=True)
-        current = None
-    buyer_text = buyer_label(current) if current else f"{group['buyer_name']} (статус неизвестен)"
+    if group.get("buyer_scope") == "all" or group["buyer_id"] == "*":
+        buyer_text = "🌐 Общая статистика (все байеры)"
+    else:
+        try:
+            with mysql_stats.connection() as mysql:
+                current = mysql_stats.buyer(mysql, group["buyer_id"])
+        except Exception:
+            log.warning("Could not refresh buyer status in group card", exc_info=True)
+            current = None
+        buyer_text = buyer_label(current) if current else f"{group['buyer_name']} (статус неизвестен)"
     kb = types.InlineKeyboardMarkup()
     kb.row(types.InlineKeyboardButton(
         "🔁 Сменить байера", callback_data=f"change:{group_id}:{page}"
@@ -601,7 +622,7 @@ def admin_callback(call):
             bot.edit_message_text(
                 f"Группа: {title}\nТопик: "
                 f"{topic_label(state.get('topic_title', ALL_TOPICS), state.get('topic_id'))}"
-                f"\nБайер: {buyer_label(chosen)}\nПодтвердить привязку?",
+                f"\nБайер: {buyer_display(chosen)}\nПодтвердить привязку?",
                 chat_id, mid,
                 reply_markup=confirm_keyboard(state.get("mode") == "change_buyer"),
             )
@@ -612,8 +633,11 @@ def admin_callback(call):
                         or state.get("message_id") != mid):
                     raise ValueError("Подтверждение устарело. Начните заново.")
                 selected = state["selected"]
-            with mysql_stats.connection() as mysql:
-                current = mysql_stats.buyer(mysql, selected)
+            if selected == "*":
+                current = GLOBAL_BUYER
+            else:
+                with mysql_stats.connection() as mysql:
+                    current = mysql_stats.buyer(mysql, selected)
             if not current:
                 raise ValueError("Байер больше не найден в MySQL.")
             # get_chat also checks that the bot can access the selected group.
@@ -634,7 +658,8 @@ def admin_callback(call):
                            current["id"], current["name"],
                            topic_id=state.get("topic_id"),
                            topic_title=state.get("topic_title", ALL_TOPICS),
-                           is_forum=bool(getattr(chat, "is_forum", False)))
+                           is_forum=bool(getattr(chat, "is_forum", False)),
+                           buyer_scope="all" if selected == "*" else "single")
             reset_pending(uid)
             log.info(
                 "Bound group chat_id=%s title=%r buyer_id=%s buyer=%s topic_id=%s by_user=%s",
@@ -1050,6 +1075,7 @@ def process_question(request: dict) -> None:
         with closing(open_db(DATABASE)) as conn:
             current = get_group(conn, message.chat.id)
         if (not current or current["buyer_id"] != group["buyer_id"]
+                or current["buyer_scope"] != group["buyer_scope"]
                 or current["topic_id"] != group["topic_id"]):
             log.info("Skipped stale answer after group scope change chat_id=%s", message.chat.id)
             return

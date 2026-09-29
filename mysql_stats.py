@@ -108,6 +108,11 @@ def buyers(conn) -> list[dict]:
                 for row in cursor.fetchall()]
 
 
+def buyer_list(conn) -> list[dict]:
+    """Explicit alias used by global-scope analytics tools."""
+    return buyers(conn)
+
+
 def buyer(conn, buyer_id: str) -> dict | None:
     cols = discover(conn)
     id_col, name_col = (quoted(cols[k]) for k in ("traffer_id", "traffer_name"))
@@ -140,7 +145,12 @@ def statistics(conn, buyer_id: str, first: date, last: date,
     cols = discover(conn)
     q = lambda key: quoted(cols[key])
     events_buyer_filter = (
-        f"AND {q('stats_buyer')}=%s" if cols["stats_buyer"] else ""
+        f"AND {q('stats_buyer')}=%s"
+        if cols["stats_buyer"] and buyer_id != "*"
+        else ""
+    )
+    cost_buyer_filter = (
+        f"AND {q('creo_buyer')}=%s" if buyer_id != "*" else ""
     )
     # Both predicates are parameterized. LOCATE treats %, _ and backslashes
     # as literal characters, unlike a LIKE expression.
@@ -165,8 +175,8 @@ def statistics(conn, buyer_id: str, first: date, last: date,
                    SUM(CAST(NULLIF(TRIM({q("creo_spend")}), '') AS DECIMAL(20,8))) AS spend,
                    SUM({q("creo_spend")} IS NULL OR TRIM({q("creo_spend")})='') AS missing_spend_rows
             FROM `creos`
-            WHERE {q("creo_buyer")}=%s
-              AND {q("creo_date")} >= %s AND {q("creo_date")} < %s
+            WHERE {q("creo_date")} >= %s AND {q("creo_date")} < %s
+              {cost_buyer_filter}
               {cost_creative_filter}
             GROUP BY DATE({q("creo_date")}), {q("creo_name")}
         ) AS cost
@@ -188,11 +198,15 @@ def statistics(conn, buyer_id: str, first: date, last: date,
     from datetime import timedelta
     end_exclusive = last + timedelta(days=1)
     with conn.cursor() as cursor:
-        parameters = [buyer_id, first, end_exclusive, first, end_exclusive]
+        parameters = [first, end_exclusive]
+        if buyer_id != "*":
+            parameters.append(buyer_id)
         if creative:
-            parameters = [buyer_id, first, end_exclusive, creative,
-                          first, end_exclusive, creative]
-        if cols["stats_buyer"]:
+            parameters.append(creative)
+        parameters.extend([first, end_exclusive])
+        if creative:
+            parameters.append(creative)
+        if cols["stats_buyer"] and buyer_id != "*":
             parameters.append(buyer_id)
         cursor.execute(query, parameters)
         return [
@@ -218,9 +232,14 @@ def availability(conn, buyer_id: str, first: date, last: date) -> list[dict]:
                        COUNT(*) AS creative_rows,
                        COUNT(DISTINCT {quoted(cols["creo_name"])}) AS creative_count,
                        SUM({spend_col} IS NULL OR TRIM({spend_col})='') AS missing_spend_rows
-                FROM `creos` WHERE {buyer_col}=%s AND {date_col} >= %s AND {date_col} < %s
+                FROM `creos` WHERE {date_col} >= %s AND {date_col} < %s
+                {"AND " + buyer_col + "=%s" if buyer_id != "*" else ""}
                 GROUP BY DATE({date_col}) ORDER BY stat_date""",
-            (buyer_id, first, last + timedelta(days=1)),
+            (
+                (first, last + timedelta(days=1), buyer_id)
+                if buyer_id != "*"
+                else (first, last + timedelta(days=1))
+            ),
         )
         return [
             {
@@ -267,6 +286,7 @@ def source_statistics(
 
     end = last + timedelta(days=1)
     source_filter = "AND b.traf_type=%s" if source else ""
+    buyer_filter = "" if buyer_id == "*" else f"AND c.{q('creo_buyer')}=%s"
     source_query = f"""
         SELECT DATE(c.{q("creo_date")}) AS stat_date,
                c.{q("creo_name")} AS creative_name,
@@ -277,7 +297,7 @@ def source_statistics(
                SUM(c.{q("creo_spend")} IS NULL OR TRIM(c.{q("creo_spend")})='') AS missing_spend_rows
         FROM creos c
         LEFT JOIN bloggers b ON b.{blog_id}=c.id_blog
-        WHERE c.{q("creo_buyer")}=%s
+        WHERE 1=1 {buyer_filter}
           AND c.{q("creo_date")} >= %s AND c.{q("creo_date")} < %s
           {source_filter}
         GROUP BY DATE(c.{q("creo_date")}), c.{q("creo_name")},
@@ -296,7 +316,7 @@ def source_statistics(
         GROUP BY DATE({q("stats_date")}), {q("stats_name")}
     """
     with conn.cursor() as cursor:
-        source_params = [buyer_id, first, end]
+        source_params = ([first, end] if buyer_id == "*" else [buyer_id, first, end])
         if source:
             source_params.append(source)
         cursor.execute(source_query, source_params)
@@ -391,6 +411,7 @@ def country_statistics(
     from datetime import timedelta
     end = last + timedelta(days=1)
     source_filter = "AND owners.source_type=%s" if source else ""
+    buyer_filter = "" if buyer_id == "*" else f"AND c.{cbuyer}=%s"
     country_filter = "AND cs.country=%s" if country else ""
     creative_filter = "AND LOWER(cs.creative_name)=LOWER(%s)" if creative else ""
     # Existing imported test records have two date representations for one
@@ -417,7 +438,7 @@ def country_statistics(
                    COALESCE(b.{blog_name},c.id_blog) AS source_name
             FROM creos c
             LEFT JOIN bloggers b ON b.{blog_id}=c.id_blog
-            WHERE c.{cbuyer}=%s
+            WHERE 1=1 {buyer_filter}
               AND LEFT(c.{cdate},10)>=%s AND LEFT(c.{cdate},10)<%s
             GROUP BY LEFT(c.{cdate},10),c.{cname},c.{cbuyer},
                      c.id_blog,b.{blog_type},b.{blog_name}
@@ -438,11 +459,13 @@ def country_statistics(
         WHERE 1=1 {source_filter} {country_filter} {creative_filter}
         ORDER BY cs.stat_date, cs.regs DESC, cs.country
     """
-    params = [
+    params = [first.isoformat(), end.isoformat()]
+    if buyer_id != "*":
+        params.append(buyer_id)
+    params.extend([
         first.isoformat(), end.isoformat(),
-        buyer_id, first.isoformat(), end.isoformat(),
         first.isoformat(), end.isoformat(),
-    ]
+    ])
     if source:
         params.append(source)
     if country:
