@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from copy import deepcopy
 from datetime import date, datetime, timedelta
@@ -15,6 +16,99 @@ import mysql_stats
 from settings import SERVICE_TIER, TIMEZONE
 
 log = logging.getLogger(__name__)
+
+
+_REASONING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max"}
+_AUTO_REASONING_VALUES = {"", "auto", "adaptive", "automatic"}
+
+_COMPARISON_RE = re.compile(
+    r"\b(?:сравн\w*|сопостав\w*|разниц\w*|динамик\w*|изменен\w*|"
+    r"лучше|хуже|против|vs)\b",
+    re.IGNORECASE,
+)
+_PERIOD_RE = re.compile(
+    r"\b(?:сегодня|вчера|позавчера|недел\w*|месяц\w*|"
+    r"за\s+\d+\s+(?:день|дня|дней)|\d{4}-\d{2}-\d{2})\b",
+    re.IGNORECASE,
+)
+_DIMENSION_RE = re.compile(
+    r"\b(?:баер\w*|байер\w*|групп\w*|источник\w*|трафик\w*|"
+    r"креатив\w*|стран\w*|канал\w*|географ\w*|воронк\w*)\b",
+    re.IGNORECASE,
+)
+_RECOMMENDATION_RE = re.compile(
+    r"\b(?:почему|причин\w*|что\s+(?:делать|изменить)|"
+    r"как\s+(?:улучшить|масштабировать)|масштаб\w*|рекомендац\w*|"
+    r"совет\w*|бюджет\w*|точк\w*\s+рост\w*|инсайт\w*)\b",
+    re.IGNORECASE,
+)
+_MULTI_ENTITY_RE = re.compile(
+    r"\b(?:все\s+(?:баер\w*|байер\w*)|всех\s+(?:баер\w*|байер\w*)|"
+    r"кажд\w*|нескольк\w*|двух|тр[еиё]х|мног\w*)\b",
+    re.IGNORECASE,
+)
+_VAGUE_RE = re.compile(
+    r"\b(?:в\s+целом|общая\s+картина|что\s+происходит|как\s+идут\s+дела|"
+    r"максимум\s+данных|подробн\w*|детальн\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def select_reasoning_effort(
+    question: str,
+    configured: str | None = None,
+) -> str:
+    """Choose a reasoning level without spending an extra LLM request."""
+    configured_value = (configured or "").strip().lower()
+    if configured_value not in _AUTO_REASONING_VALUES:
+        if configured_value in _REASONING_LEVELS:
+            return configured_value
+        log.warning("Unknown reasoning effort %r; using adaptive routing",
+                    configured)
+
+    text = " ".join((question or "").casefold().split())
+    score = 0
+
+    period_count = len(set(_PERIOD_RE.findall(text)))
+    multiple_periods = period_count >= 2
+    if multiple_periods or re.search(
+        r"\b(?:за\s+период|по\s+дням|день\s+к\s+дню)\b", text
+    ):
+        score += 2 if multiple_periods else 1
+    if _COMPARISON_RE.search(text):
+        score += 1
+
+    dimensions = set(_DIMENSION_RE.findall(text))
+    if len(dimensions) >= 2:
+        score += 1
+    if _MULTI_ENTITY_RE.search(text):
+        score += 1
+    asks_for_reason_or_recommendation = bool(_RECOMMENDATION_RE.search(text))
+    if asks_for_reason_or_recommendation:
+        score += 2
+    if _VAGUE_RE.search(text):
+        score += 1
+
+    # A queued batch can contain several independent questions.
+    if "ответь на все вопросы" in text or "накопивш" in text:
+        score += 1
+
+    # Causal explanations and recommendations are always high-complexity:
+    # they require checking several metrics before drawing a conclusion.
+    if asks_for_reason_or_recommendation:
+        selected = "high"
+    elif score >= 5:
+        selected = "high"
+    elif score >= 2:
+        selected = "medium"
+    else:
+        selected = "low"
+    log.info(
+        "Adaptive reasoning selected=%s score=%s periods=%s dimensions=%s "
+        "question=%r",
+        selected, score, period_count, len(dimensions), _preview(question),
+    )
+    return selected
 
 
 def _preview(text: str | None, limit: int = 160) -> str:

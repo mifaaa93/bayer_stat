@@ -56,8 +56,10 @@ TRANSCRIPTION_QUEUE_SIZE=50
 поставьте `LOG_LEVEL=DEBUG`.
 
 `OPENAI_REASONING_EFFORT` передаётся в API как `reasoning_effort`
-(`minimal` / `low` / `medium` / `high`). Пустое значение — параметр не
-отправляется.
+(`minimal` / `low` / `medium` / `high`). Значение `auto` включает локальный
+детерминированный выбор уровня: простые запросы идут с `low`, сравнения и
+детализация — с `medium`, а поиск причин и рекомендации — с `high`.
+Явно заданный уровень отключает автоматический выбор.
 
 Бот читает схему нужных таблиц через `information_schema` при первом запросе.
 Предполагаемые поля: `creos` — `date`, `creo_name`, `budget`, `id_traf`;

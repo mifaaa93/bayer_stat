@@ -21,7 +21,7 @@ from telebot import types, util
 from telebot.apihelper import ApiTelegramException
 
 import mysql_stats
-from ai_analysis import Analyst
+from ai_analysis import Analyst, select_reasoning_effort
 from db import (
     bind_group, clear_group_context, count_groups, forget_topic, get_group, init_db,
     list_groups, load_group_context, observed_topics, open_db,
@@ -1040,7 +1040,7 @@ def process_question(request: dict) -> None:
             group["buyer_id"], group["buyer_name"], os.environ["OPENAI_API_KEY"],
             os.environ["OPENAI_MODEL"],
             os.getenv("OPENAI_BASE_URL", "https://ru.cheapvibecode.ru/v1"),
-            reasoning_effort=REASONING_EFFORT,
+            reasoning_effort=select_reasoning_effort(question, REASONING_EFFORT),
         )
         done = threading.Event()
         post_tool_status_sent = False
