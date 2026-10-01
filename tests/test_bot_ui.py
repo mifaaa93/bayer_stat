@@ -247,7 +247,7 @@ def test_picker_confirmation_edits_same_message(monkeypatch):
             assert calls[-1][2] == 10
             kb = calls[-1][3]["reply_markup"]
             assert kb.keyboard[0][0].text == "🌐 Общая статистика (все байеры)"
-            assert kb.keyboard[1][0].text == "Buyer (работает)"
+            assert kb.keyboard[1][0].text == "Buyer (работает) · новая"
             assert "*" in bot.pending[42]["buyers"]
             for data in ("pick:5", "confirm"):
                 call = SimpleNamespace(

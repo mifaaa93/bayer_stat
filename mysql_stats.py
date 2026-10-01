@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import os
 import re
 from contextlib import contextmanager
@@ -14,6 +15,52 @@ import settings  # loads the ignored .env before reading MYSQL_* variables
 
 TABLES = ("buyer_stats_today_start_sub", "creos", "traffers")
 IDENT = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+ACTIVE_FUNNEL = contextvars.ContextVar("bayer_mysql_funnel", default="new")
+
+# Picker and AI may use only these new-funnel traffer ids, plus «все байеры».
+# Pavel in the old funnel is the whole Farm cabinet (leadb traffer id 18).
+SELECTABLE_IDS = ("1", "5")
+OLD_FUNNEL = {
+    "1": {"buyer_id": "18", "cabinet": "Farm"},
+}
+
+
+def allowed_funnels(buyer_id: str) -> tuple[str, ...]:
+    if buyer_id in OLD_FUNNEL:
+        return ("new", "old")
+    return ("new",)
+
+
+def funnel_hint(buyer_id: str) -> str:
+    if buyer_id in OLD_FUNNEL:
+        return "Доступны новая и старая воронки."
+    return "Доступна только новая воронка."
+
+
+def database_name(funnel: str = "new") -> str:
+    if funnel == "old":
+        name = os.getenv("MYSQL_DATABASE_OLD", "").strip()
+        if not name:
+            raise RuntimeError("Не настроена старая база: MYSQL_DATABASE_OLD")
+        return name
+    if funnel != "new":
+        raise RuntimeError("Неизвестная воронка")
+    if not os.getenv("MYSQL_DATABASE"):
+        raise RuntimeError("Не настроена новая база: MYSQL_DATABASE")
+    return os.environ["MYSQL_DATABASE"]
+
+
+def schema_name(conn) -> str:
+    return getattr(conn, "schema_name", None) or database_name(ACTIVE_FUNNEL.get())
+
+
+@contextmanager
+def use_funnel(funnel: str):
+    token = ACTIVE_FUNNEL.set(funnel)
+    try:
+        yield
+    finally:
+        ACTIVE_FUNNEL.reset(token)
 
 
 def configured() -> bool:
@@ -23,22 +70,24 @@ def configured() -> bool:
 
 @contextmanager
 def connection():
-    missing = [k for k in ("MYSQL_HOST", "MYSQL_USER", "MYSQL_PASSWORD", "MYSQL_DATABASE")
+    missing = [k for k in ("MYSQL_HOST", "MYSQL_USER", "MYSQL_PASSWORD")
                if not os.getenv(k)]
     if missing:
         raise RuntimeError("Не настроен MySQL: " + ", ".join(missing))
+    database = database_name(ACTIVE_FUNNEL.get())
     conn = pymysql.connect(
         host=os.environ["MYSQL_HOST"],
         port=int(os.getenv("MYSQL_PORT", "3306")),
         user=os.environ["MYSQL_USER"],
         password=os.environ["MYSQL_PASSWORD"],
-        database=os.environ["MYSQL_DATABASE"],
+        database=database,
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
         connect_timeout=10,
         read_timeout=30,
         autocommit=True,
     )
+    conn.schema_name = database
     try:
         yield conn
     finally:
@@ -66,7 +115,7 @@ def discover(conn) -> dict:
             cursor.execute(
                 "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
                 "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
-                (os.environ["MYSQL_DATABASE"], table),
+                (schema_name(conn), table),
             )
             columns = {row["COLUMN_NAME"] for row in cursor.fetchall()}
             if not columns:
@@ -90,6 +139,8 @@ def discover(conn) -> dict:
         "traffer_id": pick(t, ("id_traf", "id", "traffer_id", "buyer_id"), "traffers"),
         "traffer_name": pick(t, ("name", "traffer_name", "buyer_name", "title", "fio"), "traffers"),
         "traffer_status": pick(t, ("traffer_status", "status"), "traffers"),
+        "creo_chats": "chats" if "chats" in c else None,
+        "creo_subs": "subs" if "subs" in c else None,
     }
 
 
@@ -109,8 +160,21 @@ def buyers(conn) -> list[dict]:
 
 
 def buyer_list(conn) -> list[dict]:
-    """Explicit alias used by global-scope analytics tools."""
-    return buyers(conn)
+    """Buyers the picker and the model may select. Not the whole traffers table."""
+    by_id = {row["id"]: row for row in buyers(conn)}
+    selected = []
+    for buyer_id in SELECTABLE_IDS:
+        row = by_id.get(buyer_id)
+        if not row:
+            continue
+        row = dict(row)
+        row["funnels"] = list(allowed_funnels(buyer_id))
+        link = OLD_FUNNEL.get(buyer_id)
+        if link:
+            row["old_buyer_id"] = link["buyer_id"]
+            row["old_cabinet"] = link["cabinet"]
+        selected.append(row)
+    return selected
 
 
 def buyer(conn, buyer_id: str) -> dict | None:
@@ -136,7 +200,8 @@ def _number(value):
 
 
 def statistics(conn, buyer_id: str, first: date, last: date,
-               creative: str | None = None, exact: bool = False) -> list[dict]:
+               creative: str | None = None, exact: bool = False,
+               name_token: str | None = None) -> list[dict]:
     """Aggregate by buyer, calendar date and creative, as in the DataLens join.
 
     Stats are aggregated before joining to ad spend to avoid multiplication
@@ -163,6 +228,16 @@ def statistics(conn, buyer_id: str, first: date, last: date,
 
     cost_creative_filter = creative_predicate(q("creo_name"))
     event_creative_filter = creative_predicate(q("stats_name"))
+    token_cost = f"AND LOCATE(LOWER(%s), LOWER({q('creo_name')}))>0" if name_token else ""
+    token_events = f"AND LOCATE(LOWER(%s), LOWER({q('stats_name')}))>0" if name_token else ""
+    chat_select = ""
+    chat_outer = ""
+    if cols.get("creo_chats") and cols.get("creo_subs"):
+        chat_select = (
+            f", SUM(CAST(NULLIF(TRIM({q('creo_chats')}), '') AS DECIMAL(20,8))) AS chats"
+            f", SUM(CAST(NULLIF(TRIM({q('creo_subs')}), '') AS DECIMAL(20,8))) AS subs"
+        )
+        chat_outer = ", cost.chats AS chats, cost.subs AS creo_subs"
     query = f"""
         SELECT cost.day AS stat_date, cost.creative_name, cost.spend,
                cost.missing_spend_rows,
@@ -170,14 +245,17 @@ def statistics(conn, buyer_id: str, first: date, last: date,
                COALESCE(events.subs,0) AS subs,
                COALESCE(events.regs,0) AS regs,
                COALESCE(events.ftd,0) AS ftd
+               {chat_outer}
         FROM (
             SELECT DATE({q("creo_date")}) AS day, {q("creo_name")} AS creative_name,
                    SUM(CAST(NULLIF(TRIM({q("creo_spend")}), '') AS DECIMAL(20,8))) AS spend,
                    SUM({q("creo_spend")} IS NULL OR TRIM({q("creo_spend")})='') AS missing_spend_rows
+                   {chat_select}
             FROM `creos`
             WHERE {q("creo_date")} >= %s AND {q("creo_date")} < %s
               {cost_buyer_filter}
               {cost_creative_filter}
+              {token_cost}
             GROUP BY DATE({q("creo_date")}), {q("creo_name")}
         ) AS cost
         LEFT JOIN (
@@ -189,6 +267,7 @@ def statistics(conn, buyer_id: str, first: date, last: date,
             FROM `buyer_stats_today_start_sub`
             WHERE {q("stats_date")} >= %s AND {q("stats_date")} < %s
               {event_creative_filter}
+              {token_events}
               {events_buyer_filter}
             GROUP BY DATE({q("stats_date")}), {q("stats_name")}
         ) AS events
@@ -203,22 +282,33 @@ def statistics(conn, buyer_id: str, first: date, last: date,
             parameters.append(buyer_id)
         if creative:
             parameters.append(creative)
+        if name_token:
+            parameters.append(name_token)
         parameters.extend([first, end_exclusive])
         if creative:
             parameters.append(creative)
+        if name_token:
+            parameters.append(name_token)
         if cols["stats_buyer"] and buyer_id != "*":
             parameters.append(buyer_id)
         cursor.execute(query, parameters)
-        return [
-            {"stat_date": str(row["stat_date"]), "creative_name": row["creative_name"],
-             "spend_missing": bool(row["missing_spend_rows"]),
-             "spend": _number(row["spend"]),
-             **{metric: _number(row[metric]) for metric in ("starts", "subs", "regs", "ftd")}}
-            for row in cursor.fetchall()
-        ]
+        rows = []
+        for row in cursor.fetchall():
+            item = {
+                "stat_date": str(row["stat_date"]), "creative_name": row["creative_name"],
+                "spend_missing": bool(row["missing_spend_rows"]),
+                "spend": _number(row["spend"]),
+                **{metric: _number(row[metric]) for metric in ("starts", "subs", "regs", "ftd")},
+            }
+            if cols.get("creo_chats") and cols.get("creo_subs"):
+                item["chats"] = _number(row.get("chats"))
+                item["creo_subs"] = _number(row.get("creo_subs"))
+            rows.append(item)
+        return rows
 
 
-def availability(conn, buyer_id: str, first: date, last: date) -> list[dict]:
+def availability(conn, buyer_id: str, first: date, last: date,
+                 name_token: str | None = None) -> list[dict]:
     """Dates with buyer-specific creatives and count of missing spend values."""
     from datetime import timedelta
 
@@ -234,12 +324,14 @@ def availability(conn, buyer_id: str, first: date, last: date) -> list[dict]:
                        SUM({spend_col} IS NULL OR TRIM({spend_col})='') AS missing_spend_rows
                 FROM `creos` WHERE {date_col} >= %s AND {date_col} < %s
                 {"AND " + buyer_col + "=%s" if buyer_id != "*" else ""}
+                {"AND LOCATE(LOWER(%s), LOWER(" + quoted(cols["creo_name"]) + "))>0"
+                 if name_token else ""}
                 GROUP BY DATE({date_col}) ORDER BY stat_date""",
             (
                 (first, last + timedelta(days=1), buyer_id)
                 if buyer_id != "*"
                 else (first, last + timedelta(days=1))
-            ),
+            ) + ((name_token,) if name_token else ()),
         )
         return [
             {
@@ -257,7 +349,7 @@ def _columns_for(conn, table: str) -> set[str]:
         cursor.execute(
             "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
             "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
-            (os.environ["MYSQL_DATABASE"], table),
+            (schema_name(conn), table),
         )
         columns = {row["COLUMN_NAME"] for row in cursor.fetchall()}
     if not columns:
@@ -266,7 +358,8 @@ def _columns_for(conn, table: str) -> set[str]:
 
 
 def source_statistics(
-    conn, buyer_id: str, first: date, last: date, source: str | None = None
+    conn, buyer_id: str, first: date, last: date, source: str | None = None,
+    name_token: str | None = None,
 ) -> dict:
     """Return source-tagged spend and safely attributable funnel metrics.
 
@@ -287,6 +380,9 @@ def source_statistics(
     end = last + timedelta(days=1)
     source_filter = "AND b.traf_type=%s" if source else ""
     buyer_filter = "" if buyer_id == "*" else f"AND c.{q('creo_buyer')}=%s"
+    token_filter = (
+        f"AND LOCATE(LOWER(%s), LOWER(c.{q('creo_name')}))>0" if name_token else ""
+    )
     source_query = f"""
         SELECT DATE(c.{q("creo_date")}) AS stat_date,
                c.{q("creo_name")} AS creative_name,
@@ -299,6 +395,7 @@ def source_statistics(
         LEFT JOIN bloggers b ON b.{blog_id}=c.id_blog
         WHERE 1=1 {buyer_filter}
           AND c.{q("creo_date")} >= %s AND c.{q("creo_date")} < %s
+          {token_filter}
           {source_filter}
         GROUP BY DATE(c.{q("creo_date")}), c.{q("creo_name")},
                  c.id_blog, b.{blog_type}, b.{blog_name}
@@ -317,6 +414,8 @@ def source_statistics(
     """
     with conn.cursor() as cursor:
         source_params = ([first, end] if buyer_id == "*" else [buyer_id, first, end])
+        if name_token:
+            source_params.append(name_token)
         if source:
             source_params.append(source)
         cursor.execute(source_query, source_params)
@@ -394,7 +493,7 @@ def source_statistics(
 def country_statistics(
     conn, buyer_id: str, first: date, last: date,
     source: str | None = None, country: str | None = None,
-    creative: str | None = None,
+    creative: str | None = None, name_token: str | None = None,
 ) -> list[dict]:
     """Country registrations/FTD joined to the bound buyer and source.
 
@@ -414,6 +513,9 @@ def country_statistics(
     buyer_filter = "" if buyer_id == "*" else f"AND c.{cbuyer}=%s"
     country_filter = "AND cs.country=%s" if country else ""
     creative_filter = "AND LOWER(cs.creative_name)=LOWER(%s)" if creative else ""
+    token_filter = (
+        "AND LOCATE(LOWER(%s), LOWER(cs.creative_name))>0" if name_token else ""
+    )
     # Existing imported test records have two date representations for one
     # country/creative/day. MAX deduplicates that legacy pair; future rows
     # should have unique keys as specified by the owner.
@@ -456,7 +558,7 @@ def country_statistics(
         ) ownership
           ON ownership.stat_date=cs.stat_date
          AND ownership.creative_name=cs.creative_name
-        WHERE 1=1 {source_filter} {country_filter} {creative_filter}
+        WHERE 1=1 {source_filter} {country_filter} {creative_filter} {token_filter}
         ORDER BY cs.stat_date, cs.regs DESC, cs.country
     """
     params = [first.isoformat(), end.isoformat()]
@@ -472,6 +574,8 @@ def country_statistics(
         params.append(country)
     if creative:
         params.append(creative)
+    if name_token:
+        params.append(name_token)
     with conn.cursor() as cursor:
         cursor.execute(query, params)
         result: list[dict] = []

@@ -165,7 +165,7 @@ def test_all_ai_tools_belong_to_bound_buyer(monkeypatch):
          "spend_missing": False, "starts": 2, "subs": 1, "regs": 0, "ftd": 0},
     ]
 
-    def stats(conn, buyer_id, first, last, creative=None, exact=False):
+    def stats(conn, buyer_id, first, last, creative=None, exact=False, **kwargs):
         queries.append((buyer_id, creative, exact))
         return [
             row for row in rows
@@ -177,7 +177,7 @@ def test_all_ai_tools_belong_to_bound_buyer(monkeypatch):
         ]
 
     monkeypatch.setattr(mysql_stats, "statistics", stats)
-    monkeypatch.setattr(mysql_stats, "availability", lambda conn, buyer_id, first, last: [
+    monkeypatch.setattr(mysql_stats, "availability", lambda conn, buyer_id, first, last, **kwargs: [
         {"date": "2026-09-26", "creative_count": 2, "creative_rows": 2,
          "missing_spend_rows": 1}
     ])
@@ -391,7 +391,7 @@ def test_global_scope_can_compare_buyers(monkeypatch):
             return False
 
     monkeypatch.setattr(mysql_stats, "connection", lambda: Context())
-    names = {"5": "Анастасия", "6": "Иван"}
+    names = {"1": "NEW_Pavel", "5": "NEW_Anastacia"}
     monkeypatch.setattr(mysql_stats, "buyer", lambda conn, buyer_id: {
         "id": str(buyer_id), "name": names[str(buyer_id)], "status": "Работает",
     })
@@ -403,10 +403,10 @@ def test_global_scope_can_compare_buyers(monkeypatch):
                         }])
     model = Analyst("*", "Все байеры", "key", "model", "https://example.test/v1")
     result = model.call_tool("compare_buyers", {
-        "date_from": "2026-09-29", "buyer_ids": ["5", "6"],
+        "date_from": "2026-09-29", "buyer_ids": ["1", "5"],
     })
     assert result["has_data"]
-    assert [item["buyer"]["id"] for item in result["buyers"]] == ["5", "6"]
+    assert [item["buyer"]["id"] for item in result["buyers"]] == ["1", "5"]
 
 
 def test_single_scope_cannot_select_or_compare_other_buyers(monkeypatch):
@@ -664,7 +664,8 @@ def test_country_tools_respect_bound_buyer_and_total_before_limit(monkeypatch):
         lambda conn, buyer_id: {"id": buyer_id, "name": "Buyer"},
     )
     captured = []
-    def rows(conn, buyer_id, first, last, source=None, country=None, creative=None):
+    def rows(conn, buyer_id, first, last, source=None, country=None, creative=None,
+             name_token=None):
         captured.append((buyer_id, source, country, creative))
         if first == date(2026, 9, 27):
             return [
@@ -703,3 +704,59 @@ def test_country_tools_respect_bound_buyer_and_total_before_limit(monkeypatch):
     assert comparison["has_data"]
     assert {row["country"] for row in comparison["changes"]} == {"SA", "IQ"}
     assert all(buyer_id == "5" for buyer_id, *_ in captured)
+
+
+def test_name_token_filters_both_sides(monkeypatch):
+    monkeypatch.setenv("MYSQL_DATABASE", "test")
+    conn = Conn(COLS)
+    mysql_stats.statistics(
+        conn, "18", date(2026, 9, 26), date(2026, 9, 26), name_token="Pavel",
+    )
+    assert conn.cursor_obj.last.count("LOCATE(LOWER(%s)") == 2
+    assert conn.cursor_obj.params.count("Pavel") == 2
+    assert "Pavel" not in conn.cursor_obj.last
+
+
+def test_pavel_reads_both_funnels_and_anastacia_only_new(monkeypatch):
+    class Context:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setenv("MYSQL_DATABASE", "lea_partners_db")
+    monkeypatch.setenv("MYSQL_DATABASE_OLD", "leadb")
+    monkeypatch.setattr(mysql_stats, "connection", lambda: Context())
+    monkeypatch.setattr(mysql_stats, "buyer", lambda conn, buyer_id: {
+        "id": str(buyer_id),
+        "name": "Farm" if str(buyer_id) == "18" else "NEW_Pavel",
+        "status": "Работает",
+    })
+    seen = []
+
+    def stats(conn, buyer_id, first, last, **kwargs):
+        seen.append((str(buyer_id), kwargs.get("name_token"), mysql_stats.ACTIVE_FUNNEL.get()))
+        return [{
+            "stat_date": "2026-09-29", "creative_name": "A", "spend": 1,
+            "spend_missing": False, "starts": 2, "subs": 1, "regs": 0, "ftd": 0,
+        }]
+
+    monkeypatch.setattr(mysql_stats, "statistics", stats)
+    both = Analyst("1", "NEW_Pavel", "key", "model", "https://example.test/v1").call_tool(
+        "get_overview", {"date_from": "2026-09-29"},
+    )
+    assert both["funnel"] == "both" and both["has_data"]
+    assert ("1", None, "new") in seen
+    assert ("18", None, "old") in seen
+    assert "creative_name_contains" not in both["old_funnel"]
+    assert both["old_funnel"]["database"] == "leadb"
+    assert both["old_funnel"]["cabinet_id"] == "18"
+    refused = Analyst(
+        "5", "NEW_Anastacia", "key", "model", "https://example.test/v1",
+    ).call_tool("get_overview", {"date_from": "2026-09-29", "funnel": "old"})
+    assert "только новая" in refused["error"]
+    unknown = Analyst("*", "Все байеры", "key", "model", "https://example.test/v1").call_tool(
+        "get_buyer_statistics", {"date_from": "2026-09-29", "buyer_id": "6"},
+    )
+    assert "недоступен" in unknown["error"]
