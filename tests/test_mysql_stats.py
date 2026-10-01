@@ -706,6 +706,78 @@ def test_country_tools_respect_bound_buyer_and_total_before_limit(monkeypatch):
     assert all(buyer_id == "5" for buyer_id, *_ in captured)
 
 
+def test_traffer_report_is_buyer_level_and_absent_without_table():
+    class Cursor:
+        def __init__(self):
+            self.sql = ""
+            self.params = ()
+
+        def execute(self, sql, params=()):
+            self.sql = sql
+            self.params = params
+
+        def fetchall(self):
+            if "information_schema" in self.sql:
+                return [{"COLUMN_NAME": name} for name in (
+                    "date", "traffer_name", "count_start", "count_sub",
+                    "count_chat", "count_reg", "count_ftd",
+                )]
+            return [{
+                "stat_date": date(2026, 9, 29),
+                "starts": 38, "subs": 15, "chats": 7, "regs": 3, "ftd": 2,
+            }]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    conn = type("Conn", (), {"schema_name": "lea_partners_db", "cursor": lambda self: Cursor()})()
+    report = mysql_stats.traffer_report(conn, "NEW_Pavel", date(2026, 9, 29), date(2026, 9, 29))
+    assert report["totals"]["starts"] == 38
+    assert report["level"] == "buyer"
+    assert report["first_date"] == "2026-09-29"
+
+    class EmptyCursor(Cursor):
+        def fetchall(self):
+            return []
+
+    empty = type("Conn", (), {"schema_name": "leadb", "cursor": lambda self: EmptyCursor()})()
+    assert mysql_stats.traffer_report(empty, "Farm", date(2026, 9, 29), date(2026, 9, 29)) is None
+
+
+def test_new_funnel_uses_traffer_report_when_channel_starts_are_zero(monkeypatch):
+    class Context:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setenv("MYSQL_DATABASE", "lea_partners_db")
+    monkeypatch.setattr(mysql_stats, "connection", lambda: Context())
+    monkeypatch.setattr(mysql_stats, "buyer", lambda conn, buyer_id: {
+        "id": "1", "name": "NEW_Pavel", "status": "Работает",
+    })
+    monkeypatch.setattr(mysql_stats, "statistics", lambda *args, **kwargs: [{
+        "stat_date": "2026-09-29", "creative_name": "Ad", "spend": 10,
+        "spend_missing": False, "starts": 0, "subs": 0, "regs": 0, "ftd": 0,
+    }])
+    monkeypatch.setattr(mysql_stats, "traffer_report", lambda conn, name, first, last: {
+        "source": "traffers_stat", "level": "buyer", "buyer_name": name,
+        "days_count": 1, "first_date": "2026-09-29", "last_date": "2026-09-29",
+        "totals": {"starts": 38, "subs": 15, "chats": 7, "regs": 3, "ftd": 2},
+        "days": [], "truncated": False,
+    })
+    result = Analyst("1", "NEW_Pavel", "key", "model", "https://example.test/v1").call_tool(
+        "get_overview", {"date_from": "2026-09-29", "funnel": "new"},
+    )
+    assert result["starts_source"] == "traffer_report"
+    assert result["traffer_report"]["totals"]["starts"] == 38
+    assert result["totals"]["starts"] == 0
+
+
 def test_name_token_filters_both_sides(monkeypatch):
     monkeypatch.setenv("MYSQL_DATABASE", "test")
     conn = Conn(COLS)

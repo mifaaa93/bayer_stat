@@ -150,6 +150,13 @@ SYSTEM = """Ты аналитик TGAds. Сегодня {today}, часовой 
 Если воронка не указана, у Павла смотри обе (both), у остальных — новую.
 Чаты и подписки с карточки креатива приходят как chats и creo_subs.
 Их не путай с subs из таблицы событий и не складывай метрики двух воронок.
+В новой воронке поле traffer_report — отчёт трафера (traffers_stat): старты,
+подписки, чаты, регистрации и FTD байера за день, без разбивки по креативу.
+Для Павла события каналов по объявлениям Facebook пустые. Если totals.starts
+равен 0, а в traffer_report старты есть, отвечай по отчёту и прямо называй
+first_date–last_date: это не весь запрошенный период, если дни неполные.
+Если старты событий каналов уже ненулевые, не подменяй их отчётом и при
+расхождении покажи оба источника. В старой воронке этого отчёта нет.
 Для каждого вопроса о данных обязательно вызови подходящий
 инструмент: get_overview для итогов, get_funnel для конверсий,
 get_creative для одного креатива, list_creatives для рейтинга или поиска,
@@ -804,6 +811,29 @@ class Analyst:
                         result["cabinet_id"] = query_buyer
                         if name_token:
                             result["creative_name_contains"] = name_token
+                    if self._funnel == "new" and query_buyer != "*":
+                        try:
+                            report = mysql_stats.traffer_report(
+                                conn, current["name"], first, last,
+                            )
+                            if report:
+                                result["traffer_report"] = report
+                        except Exception:
+                            log.exception(
+                                "Traffer report failed buyer=%s", current["name"],
+                            )
+                        if name in ("compare_periods", "find_anomalies"):
+                            try:
+                                second_report = mysql_stats.traffer_report(
+                                    conn, current["name"], second_first, second_last,
+                                )
+                                if second_report:
+                                    result["second_traffer_report"] = second_report
+                            except Exception:
+                                log.exception(
+                                    "Traffer report failed buyer=%s period=second",
+                                    current["name"],
+                                )
                     if name in ("get_source_statistics", "compare_sources"):
                         if name == "get_source_statistics":
                             source_result = mysql_stats.source_statistics(
@@ -1173,13 +1203,26 @@ class Analyst:
             )
             return {"error": "MySQL недоступен или структура таблиц не поддерживается"}
         if not rows:
-            return {**result, "has_data": False, "rows": []}
+            payload = {**result, "has_data": False, "rows": []}
+            report = payload.get("traffer_report") or {}
+            if report.get("days_count"):
+                payload["has_data"] = True
+                if (report.get("totals") or {}).get("starts"):
+                    payload["starts_source"] = "traffer_report"
+            return payload
         result.update({
             "has_data": True, "totals": funnel(summarize(rows)),
             "creative_count": len({r["creative_name"] for r in rows}),
             "available_dates": sorted({r["stat_date"] for r in rows}),
             "note": "Если spend=null, данные о расходах неполные; это не нулевые затраты.",
         })
+        report_starts = ((result.get("traffer_report") or {}).get("totals") or {}).get("starts") or 0
+        if not (result["totals"].get("starts") or 0) and report_starts:
+            result["starts_source"] = "traffer_report"
+            result["note"] += (
+                " Старты, регистрации и FTD байера за день бери из traffer_report,"
+                " не из totals.starts."
+            )
         if name == "get_funnel":
             return result
         if name == "get_overview":

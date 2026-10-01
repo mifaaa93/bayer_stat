@@ -193,6 +193,70 @@ def buyer(conn, buyer_id: str) -> dict | None:
                 "status": str(row["buyer_status"] or "не указан")} if row else None
 
 
+def traffer_report(conn, buyer_name: str, first: date, last: date) -> dict | None:
+    """Buyer-level new-funnel totals from traffers_stat. Absent in the old database."""
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME='traffers_stat'",
+            (schema_name(conn),),
+        )
+        columns = {row["COLUMN_NAME"] for row in cursor.fetchall()}
+    needed = {"date", "traffer_name", "count_start", "count_sub",
+               "count_chat", "count_reg", "count_ftd"}
+    if not needed <= columns:
+        return None
+    from datetime import timedelta
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT DATE(`date`) AS stat_date,
+                   SUM(`count_start`) AS starts,
+                   SUM(`count_sub`) AS subs,
+                   SUM(`count_chat`) AS chats,
+                   SUM(`count_reg`) AS regs,
+                   SUM(`count_ftd`) AS ftd
+            FROM `traffers_stat`
+            WHERE `traffer_name`=%s AND `date`>=%s AND `date`<%s
+            GROUP BY DATE(`date`)
+            ORDER BY stat_date
+            """,
+            (buyer_name, first, last + timedelta(days=1)),
+        )
+        days = [
+            {
+                "date": str(row["stat_date"]),
+                "starts": _number(row["starts"]) or 0,
+                "subs": _number(row["subs"]) or 0,
+                "chats": _number(row["chats"]) or 0,
+                "regs": _number(row["regs"]) or 0,
+                "ftd": _number(row["ftd"]) or 0,
+            }
+            for row in cursor.fetchall()
+        ]
+    totals = {
+        metric: round(sum(day[metric] for day in days), 4)
+        for metric in ("starts", "subs", "chats", "regs", "ftd")
+    }
+    return {
+        "source": "traffers_stat",
+        "level": "buyer",
+        "buyer_name": buyer_name,
+        "days_count": len(days),
+        "first_date": days[0]["date"] if days else None,
+        "last_date": days[-1]["date"] if days else None,
+        "totals": totals,
+        "days": days[-31:],
+        "truncated": len(days) > 31,
+        "note": (
+            "Отчёт трафера новой воронки: итог байера за день, без креатива. "
+            "Для Facebook-байера это источник стартов, регистраций и FTD. "
+            "Не складывай эти числа с событиями каналов и с chats/creo_subs карточек. "
+            "Если days_count меньше запрошенного периода, за пропущенные дни отчёта нет."
+        ),
+    }
+
+
 def _number(value):
     if value is None:
         return None
