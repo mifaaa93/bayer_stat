@@ -43,7 +43,7 @@ def test_chat_context_is_bounded_per_chat():
                 record_group_message(conn, -1000, i, 1, "user", "Alice", f"q{i}")
             history = load_group_context(conn, -1000, None, 100)
             assert len(history) == 36
-            assert history[0]["content"] == "Alice: q9"
+            assert history[0]["content"] == "Telegram-автор Alice (это не байер): q9"
             clear_group_context(conn, -1000)
             assert load_group_context(conn, -1000, None, 100) == []
 
@@ -64,12 +64,12 @@ def test_topic_scoped_context_and_delayed_answer():
             record_group_message(conn, -100, 1, 10, "user", "Mallory", "Дубль")
             scoped = load_group_context(conn, -100, 10, before_message_id=3)
             assert scoped == [
-                {"role": "user", "content": "Alice: План"},
+                {"role": "user", "content": "Telegram-автор Alice (это не байер): План"},
                 {"role": "assistant", "content": "Ответ 1"},
             ]
             whole_group = load_group_context(conn, -100, None, before_message_id=3)
             assert [item["content"] for item in whole_group] == [
-                "Alice: План", "Ответ 1",
+                "Telegram-автор Alice (это не байер): План", "Ответ 1",
             ]
             assert conn.execute(
                 "SELECT COUNT(*) FROM group_messages WHERE thread_id=20"

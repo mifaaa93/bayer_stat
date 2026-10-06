@@ -5,7 +5,8 @@ import pytest
 
 import mysql_stats
 from ai_analysis import (
-    CLARIFY_QUESTION, Analyst, TOOL_PROGRESS, TOOLS, parse_date, summarize,
+    CLARIFY_QUESTION, Analyst, TOOL_PROGRESS, TOOLS, parse_date, report_checks,
+    spend_gaps, summarize,
 )
 
 
@@ -60,12 +61,14 @@ def test_statistics_uses_bound_buyer_and_daily_dates(monkeypatch):
     conn = Conn(COLS)
     rows = mysql_stats.statistics(conn, "5", date(2026, 9, 25), date(2026, 9, 26))
     assert rows[0]["stat_date"] == "2026-09-26"
+    assert rows[0]["events_source"] == "not_configured"
+    assert rows[0]["starts"] is None
     assert conn.cursor_obj.params == [
         date(2026, 9, 25), date(2026, 9, 27), "5",
-        date(2026, 9, 25), date(2026, 9, 27)
     ]
     assert "GROUP BY" in conn.cursor_obj.last
-    assert "JOIN" in conn.cursor_obj.last
+    assert "buyer_stats_today_start_sub" not in conn.cursor_obj.last
+    assert "SUM(CAST" not in conn.cursor_obj.last
 
 
 def test_missing_mysql_column_fails_loudly(monkeypatch):
@@ -78,9 +81,7 @@ def test_missing_mysql_column_fails_loudly(monkeypatch):
 
 def test_optional_stats_buyer_filter(monkeypatch):
     monkeypatch.setenv("MYSQL_DATABASE", "test")
-    cols = {k: set(v) for k, v in COLS.items()}
-    cols["buyer_stats_today_start_sub"].add("id_traf")
-    conn = Conn(cols)
+    conn = Conn(COLS)
     mysql_stats.statistics(conn, "5", date(2026, 9, 26), date(2026, 9, 26))
     assert "`id_traf`=%s" in conn.cursor_obj.last
     assert conn.cursor_obj.params[-1] == "5"
@@ -94,14 +95,14 @@ def test_creative_search_is_parameterized_in_both_tables(monkeypatch):
         creative="ABC_%", exact=False,
     )
     sql, params = conn.cursor_obj.last, conn.cursor_obj.params
-    assert sql.count("LOCATE(LOWER(%s)") == 2
-    assert params[3] == params[6] == "ABC_%"
+    assert sql.count("LOCATE(LOWER(%s)") == 1
+    assert params[3] == "ABC_%"
     assert "ABC_%" not in sql
     mysql_stats.statistics(
         conn, "5", date(2026, 9, 26), date(2026, 9, 26),
         creative="ABC_%", exact=True,
     )
-    assert conn.cursor_obj.last.count("=LOWER(%s)") == 2
+    assert conn.cursor_obj.last.count("=LOWER(%s)") == 1
 
 
 def test_tool_ignores_model_supplied_buyer(monkeypatch):
@@ -141,6 +142,38 @@ def test_missing_spend_is_not_zero():
     assert result["spend"] is None
     assert result["spend_incomplete"]
     assert result["cost_starts"] is None
+
+
+def test_known_spend_stays_visible_when_other_rows_are_empty():
+    rows = [
+        {"stat_date": "2026-09-30", "creative_name": "Filled", "spend": 10,
+         "spend_missing": False, "starts": 4, "subs": 1, "regs": 0, "ftd": 0},
+        {"stat_date": "2026-09-30", "creative_name": "Empty", "spend": None,
+         "spend_missing": True, "starts": 2, "subs": 1, "regs": 0, "ftd": 0},
+        {"stat_date": "2026-09-30", "creative_name": "NoEvent", "spend": 3,
+         "spend_missing": False, "spend_duplicate": True, "starts": None,
+         "subs": None, "regs": None, "ftd": None},
+    ]
+    result = summarize(rows)
+    assert result["spend"] == 13
+    assert result["spend_incomplete"]
+    assert result["events_incomplete"]
+    assert result["cost_starts"] is None
+    gaps = spend_gaps(rows)
+    assert gaps["known_spend"] == 13
+    assert gaps["matched_same_day_spend"] == 10
+    assert gaps["spend_without_same_day_event"] == 3
+    assert gaps["empty_or_conflicting_budget_rows"] == 1
+    assert gaps["duplicate_day_rows"] == 1
+    assert gaps["creatives_with_no_filled_spend"] == 1
+    assert gaps["largest_spend_without_same_day_event"][0]["creative_name"] == "NoEvent"
+    checks = report_checks(rows)
+    assert checks["events_without_budget"]["rows"] == 1
+    assert checks["events_without_budget"]["starts"] == 2
+    assert checks["spend_without_same_day_event"]["spend"] == 3
+    assert checks["duplicate_rows"]["rows"] == 1
+    assert checks["empty_budget_without_events"] == 0
+    assert checks["conflicting_budgets"]["rows"] == 0
 
 
 def test_all_ai_tools_belong_to_bound_buyer(monkeypatch):
@@ -184,9 +217,16 @@ def test_all_ai_tools_belong_to_bound_buyer(monkeypatch):
     model = Analyst("5", "Bound buyer", "key", "model", "https://example.test/v1")
     base = {"buyer_id": "999", "date_from": "2026-09-26"}
     overview = model.call_tool("get_overview", {**base, "by_day": True})
-    assert overview["has_data"] and overview["totals"]["spend"] is None
+    assert overview["has_data"] and overview["totals"]["spend"] == 2
+    assert overview["totals"]["spend_incomplete"]
+    assert overview["totals"]["cost_starts"] is None
+    assert overview["spend_gaps"]["known_spend"] == 2
+    assert overview["spend_gaps"]["empty_or_conflicting_budget_rows"] == 1
+    assert "итоговой суммы нет" in overview["note"]
+    assert overview["report_checks"]["events_without_budget"]["starts"] == 20
     assert overview["totals"]["conversion_starts_to_subs"] == 0.2727
     assert len(overview["days"]) == 1
+    assert overview["days"][0]["totals"]["spend"] == 2
     assert model.call_tool("get_funnel", base)["totals"]["regs"] == 3
     creative = model.call_tool(
         "get_creative",
@@ -747,7 +787,7 @@ def test_traffer_report_is_buyer_level_and_absent_without_table():
     assert mysql_stats.traffer_report(empty, "Farm", date(2026, 9, 29), date(2026, 9, 29)) is None
 
 
-def test_new_funnel_uses_traffer_report_when_channel_starts_are_zero(monkeypatch):
+def test_overview_does_not_replace_starts_with_a_second_report(monkeypatch):
     class Context:
         def __enter__(self):
             return object()
@@ -762,20 +802,14 @@ def test_new_funnel_uses_traffer_report_when_channel_starts_are_zero(monkeypatch
     })
     monkeypatch.setattr(mysql_stats, "statistics", lambda *args, **kwargs: [{
         "stat_date": "2026-09-29", "creative_name": "Ad", "spend": 10,
-        "spend_missing": False, "starts": 0, "subs": 0, "regs": 0, "ftd": 0,
+        "spend_missing": False, "starts": 38, "subs": 15, "regs": 3, "ftd": 2,
+        "events_source": "traffers_stat", "platform": "ФБ",
     }])
-    monkeypatch.setattr(mysql_stats, "traffer_report", lambda conn, name, first, last: {
-        "source": "traffers_stat", "level": "buyer", "buyer_name": name,
-        "days_count": 1, "first_date": "2026-09-29", "last_date": "2026-09-29",
-        "totals": {"starts": 38, "subs": 15, "chats": 7, "regs": 3, "ftd": 2},
-        "days": [], "truncated": False,
-    })
     result = Analyst("1", "NEW_Pavel", "key", "model", "https://example.test/v1").call_tool(
         "get_overview", {"date_from": "2026-09-29", "funnel": "new"},
     )
-    assert result["starts_source"] == "traffer_report"
-    assert result["traffer_report"]["totals"]["starts"] == 38
-    assert result["totals"]["starts"] == 0
+    assert "traffer_report" not in result
+    assert result["totals"]["starts"] == 38
 
 
 def test_name_token_filters_both_sides(monkeypatch):
@@ -784,8 +818,8 @@ def test_name_token_filters_both_sides(monkeypatch):
     mysql_stats.statistics(
         conn, "18", date(2026, 9, 26), date(2026, 9, 26), name_token="Pavel",
     )
-    assert conn.cursor_obj.last.count("LOCATE(LOWER(%s)") == 2
-    assert conn.cursor_obj.params.count("Pavel") == 2
+    assert conn.cursor_obj.last.count("LOCATE(LOWER(%s)") == 1
+    assert conn.cursor_obj.params.count("Pavel") == 1
     assert "Pavel" not in conn.cursor_obj.last
 
 
@@ -832,3 +866,83 @@ def test_pavel_reads_both_funnels_and_anastacia_only_new(monkeypatch):
         "get_buyer_statistics", {"date_from": "2026-09-29", "buyer_id": "6"},
     )
     assert "недоступен" in unknown["error"]
+
+
+READY = {
+    "creos": {"date", "creo_name", "budget", "id_traf"},
+    "buyer_stats_today_start_sub": {
+        "date", "creo_name", "count_start", "count_sub", "count_reg", "count_ftd",
+    },
+    "traffers": {"id", "traffer_name", "traffer_status", "platform_name"},
+    "traffers_stat": {
+        "date", "traffer_name", "creo_name", "count_start", "count_sub",
+        "count_chat", "count_reg", "count_ftd",
+    },
+}
+
+
+class ReadyCursor:
+    def __init__(self, platform):
+        self.platform = platform
+        self.calls = []
+        self.last = ""
+        self.params = ()
+
+    def execute(self, sql, params=()):
+        self.last = sql
+        self.params = params
+        self.calls.append(sql)
+
+    def fetchall(self):
+        if "information_schema" in self.last:
+            return [{"COLUMN_NAME": name} for name in READY[self.params[1]]]
+        if "FROM `traffers_stat`" in self.last or "FROM `buyer_stats_today_start_sub`" in self.last:
+            return [{
+                "stat_date": date(2026, 10, 5), "creative_name": "Ad",
+                "starts": 4, "subs": 1, "chats": 2, "regs": 1, "ftd": 0,
+            }]
+        return [{
+            "stat_date": date(2026, 10, 5), "creative_name": "Ad",
+            "row_count": 4, "budget_variants": 1, "spend": 9,
+            "missing_spend_rows": 0, "platform_name": self.platform,
+        }]
+
+    def fetchone(self):
+        return {"platform_name": self.platform, "buyer_name": "Buyer"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+
+def test_facebook_events_come_from_traffers_stat_and_spend_is_not_summed(monkeypatch):
+    monkeypatch.setenv("MYSQL_DATABASE", "lea_partners_db")
+    cursor = ReadyCursor("ФБ")
+    conn = type("Conn", (), {"schema_name": "lea_partners_db", "cursor": lambda self: cursor})()
+    rows = mysql_stats.statistics(conn, "1", date(2026, 10, 5), date(2026, 10, 5))
+    assert rows[0]["events_source"] == "traffers_stat"
+    assert rows[0]["starts"] == 4
+    assert rows[0]["chats"] == 2
+    assert rows[0]["spend"] == 9
+    assert rows[0]["spend_duplicate"]
+    joined = "\n".join(cursor.calls)
+    assert "FROM `traffers_stat`" in joined
+    assert "buyer_stats_today_start_sub" not in joined
+    assert "MAX(CAST" in joined
+    assert "{tracker.campaign_name}" in cursor.params
+    assert "{{campaign.name}}" in cursor.params
+
+
+def test_telegram_events_come_from_channel_table(monkeypatch):
+    monkeypatch.setenv("MYSQL_DATABASE", "lea_partners_db")
+    cursor = ReadyCursor("ТГ")
+    conn = type("Conn", (), {"schema_name": "lea_partners_db", "cursor": lambda self: cursor})()
+    rows = mysql_stats.statistics(conn, "5", date(2026, 10, 5), date(2026, 10, 5))
+    assert rows[0]["events_source"] == "buyer_stats_today_start_sub"
+    assert rows[0]["platform"] == "ТГ"
+    assert "chats" not in rows[0]
+    joined = "\n".join(cursor.calls)
+    assert "FROM `buyer_stats_today_start_sub`" in joined
+    assert "FROM `traffers_stat`" not in joined

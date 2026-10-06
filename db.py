@@ -228,6 +228,11 @@ def record_group_message(
         )
 
 
+def telegram_author_line(author: str, content: str) -> str:
+    """Mark a chat username so the model does not treat it as the buyer."""
+    return f"Telegram-автор {author} (это не байер): {content}"
+
+
 def load_group_context(
     conn: sqlite3.Connection, chat_id: int, topic_id: int | None,
     before_message_id: int, limit: int = 36,
@@ -247,7 +252,7 @@ def load_group_context(
         {
             "role": row["role"],
             "content": (
-                f"{row['author']}: {row['content']}"
+                telegram_author_line(row["author"], row["content"])
                 if row["role"] == "user" else row["content"]
             ),
         }

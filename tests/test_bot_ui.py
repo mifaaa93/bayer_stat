@@ -13,6 +13,30 @@ import bot
 from db import bind_group, get_group, init_db, observed_topics, open_db
 
 
+def test_question_labels_telegram_author_separately_from_buyer():
+    message = SimpleNamespace(
+        text="как прошла неделя",
+        from_user=SimpleNamespace(id=1, username="Mifaaa93", first_name="M"),
+    )
+    request = {"message": message, "question": message.text, "batch_requests": [{
+        "message": message, "question": message.text,
+    }]}
+    prompt = bot.batch_question(request)
+    assert prompt == "как прошла неделя"
+    assert "Mifaaa93" not in prompt
+    second = SimpleNamespace(
+        text="кит позавчера",
+        from_user=SimpleNamespace(id=2, username="bob", first_name="B"),
+    )
+    batch = bot.batch_question({"batch_requests": [
+        {"message": message, "question": message.text},
+        {"message": second, "question": second.text},
+    ]})
+    assert "telegram_author" in batch
+    assert "Mifaaa93" in batch and "bob" in batch
+    assert "Спросил" in batch
+
+
 def test_reply_menu_and_request_chat_button():
     menu = bot.main_keyboard()
     assert [button["text"] for row in menu.keyboard for button in row] == [
@@ -687,9 +711,9 @@ def test_followup_queued_during_answer_gets_previous_answer_in_context(monkeypat
             if question == "вчера":
                 first_started.set()
                 assert release.wait(3)
-            else:
-                second_done.set()
-            return "Ответ 1" if question == "вчера" else "Ответ 2"
+                return "Ответ 1"
+            second_done.set()
+            return "Ответ 2"
 
     with TemporaryDirectory() as folder:
         monkeypatch.setattr(bot, "DATABASE", str(Path(folder) / "bot.sqlite3"))

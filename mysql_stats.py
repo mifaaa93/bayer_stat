@@ -263,112 +263,274 @@ def _number(value):
     return float(value) if isinstance(value, Decimal) else value
 
 
-def statistics(conn, buyer_id: str, first: date, last: date,
-               creative: str | None = None, exact: bool = False,
-               name_token: str | None = None) -> list[dict]:
-    """Aggregate by buyer, calendar date and creative, as in the DataLens join.
+# Creative names that are Keitaro macros, not a real creative.
+# They are not joined to spend and are not shown as a creative.
+PLACEHOLDER_CREATIVES = ("{tracker.campaign_name}", "{{campaign.name}}")
 
-    Stats are aggregated before joining to ad spend to avoid multiplication
-    when either source has duplicate creative/date rows.
-    """
+
+def _platform_code(value: str | None) -> str | None:
+    if value is None:
+        return None
+    key = str(value).strip().casefold()
+    return {
+        "фб": "ФБ", "fb": "ФБ", "facebook": "ФБ",
+        "тг": "ТГ", "tg": "ТГ", "telegram": "ТГ",
+        "ггл": "ГГЛ", "google": "ГГЛ", "гугл": "ГГЛ",
+    }.get(key)
+
+
+def events_ready(conn) -> bool:
+    """True when this schema has the buyer's platform and creative-level traffers_stat."""
+    traffer_cols = _columns_for(conn, "traffers")
+    if "platform_name" not in traffer_cols:
+        return False
+    try:
+        stat_cols = _columns_for(conn, "traffers_stat")
+    except ValueError:
+        return False
+    needed = {"date", "traffer_name", "creo_name", "count_start",
+              "count_sub", "count_chat", "count_reg", "count_ftd"}
+    return needed <= stat_cols
+
+
+def _buyer_platform(conn, buyer_id: str) -> dict | None:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT `platform_name` AS platform_name, `traffer_name` AS buyer_name "
+            "FROM `traffers` WHERE `id`=%s LIMIT 1",
+            (buyer_id,),
+        )
+        row = cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "platform": _platform_code(row.get("platform_name")),
+        "name": str(row.get("buyer_name") or ""),
+    }
+
+
+def _creative_clause(column: str, creative: str | None, exact: bool,
+                     name_token: str | None) -> tuple[str, list]:
+    sql = ""
+    params: list = []
+    if creative:
+        if exact:
+            sql += f" AND LOWER({column})=LOWER(%s)"
+        else:
+            sql += f" AND LOCATE(LOWER(%s), LOWER({column}))>0"
+        params.append(creative)
+    if name_token:
+        sql += f" AND LOCATE(LOWER(%s), LOWER({column}))>0"
+        params.append(name_token)
+    return sql, params
+
+
+def _spend_rows(conn, buyer_id: str, first: date, last: date,
+                creative: str | None, exact: bool, name_token: str | None,
+                platform: str | None) -> list[dict]:
+    """One spend value per buyer, day and creative. Repeated creos rows are not summed."""
+    from datetime import timedelta
+
     cols = discover(conn)
     q = lambda key: quoted(cols[key])
-    events_buyer_filter = (
-        f"AND {q('stats_buyer')}=%s"
-        if cols["stats_buyer"] and buyer_id != "*"
-        else ""
+    clause, clause_params = _creative_clause(
+        f"c.{q('creo_name')}", creative, exact, name_token,
     )
-    cost_buyer_filter = (
-        f"AND {q('creo_buyer')}=%s" if buyer_id != "*" else ""
-    )
-    # Both predicates are parameterized. LOCATE treats %, _ and backslashes
-    # as literal characters, unlike a LIKE expression.
-    def creative_predicate(column: str) -> str:
-        if not creative:
-            return ""
-        if exact:
-            return f"AND LOWER({column})=LOWER(%s)"
-        return f"AND LOCATE(LOWER(%s), LOWER({column}))>0"
-
-    cost_creative_filter = creative_predicate(q("creo_name"))
-    event_creative_filter = creative_predicate(q("stats_name"))
-    token_cost = f"AND LOCATE(LOWER(%s), LOWER({q('creo_name')}))>0" if name_token else ""
-    token_events = f"AND LOCATE(LOWER(%s), LOWER({q('stats_name')}))>0" if name_token else ""
-    chat_select = ""
-    chat_outer = ""
-    if cols.get("creo_chats") and cols.get("creo_subs"):
-        chat_select = (
-            f", SUM(CAST(NULLIF(TRIM({q('creo_chats')}), '') AS DECIMAL(20,8))) AS chats"
-            f", SUM(CAST(NULLIF(TRIM({q('creo_subs')}), '') AS DECIMAL(20,8))) AS subs"
-        )
-        chat_outer = ", cost.chats AS chats, cost.subs AS creo_subs"
+    platform_sql = "AND t.`platform_name`=%s" if platform else ""
+    buyer_sql = "" if buyer_id == "*" else f"AND c.{q('creo_buyer')}=%s"
+    join_traffer = "JOIN `traffers` t ON t.`id`=c." + q("creo_buyer")
     query = f"""
-        SELECT cost.day AS stat_date, cost.creative_name, cost.spend,
-               cost.missing_spend_rows,
-               COALESCE(events.starts,0) AS starts,
-               COALESCE(events.subs,0) AS subs,
-               COALESCE(events.regs,0) AS regs,
-               COALESCE(events.ftd,0) AS ftd
-               {chat_outer}
-        FROM (
-            SELECT DATE({q("creo_date")}) AS day, {q("creo_name")} AS creative_name,
-                   SUM(CAST(NULLIF(TRIM({q("creo_spend")}), '') AS DECIMAL(20,8))) AS spend,
-                   SUM({q("creo_spend")} IS NULL OR TRIM({q("creo_spend")})='') AS missing_spend_rows
-                   {chat_select}
-            FROM `creos`
-            WHERE {q("creo_date")} >= %s AND {q("creo_date")} < %s
-              {cost_buyer_filter}
-              {cost_creative_filter}
-              {token_cost}
-            GROUP BY DATE({q("creo_date")}), {q("creo_name")}
-        ) AS cost
-        LEFT JOIN (
-            SELECT DATE({q("stats_date")}) AS day, {q("stats_name")} AS creative_name,
-                   SUM(COALESCE({q("starts")},0)) AS starts,
-                   SUM(COALESCE({q("subs")},0)) AS subs,
-                   SUM(COALESCE({q("regs")},0)) AS regs,
-                   SUM(COALESCE({q("ftd")},0)) AS ftd
-            FROM `buyer_stats_today_start_sub`
-            WHERE {q("stats_date")} >= %s AND {q("stats_date")} < %s
-              {event_creative_filter}
-              {token_events}
-              {events_buyer_filter}
-            GROUP BY DATE({q("stats_date")}), {q("stats_name")}
-        ) AS events
-          ON events.day=cost.day AND events.creative_name=cost.creative_name
-        ORDER BY cost.day, cost.creative_name
+        SELECT DATE(c.{q("creo_date")}) AS stat_date,
+               c.{q("creo_name")} AS creative_name,
+               COUNT(*) AS row_count,
+               COUNT(DISTINCT NULLIF(TRIM(c.{q("creo_spend")}), '')) AS budget_variants,
+               MAX(CAST(NULLIF(TRIM(c.{q("creo_spend")}), '') AS DECIMAL(20,8))) AS spend,
+               SUM(c.{q("creo_spend")} IS NULL OR TRIM(c.{q("creo_spend")})='') AS missing_spend_rows
+               {", t.`platform_name` AS platform_name" if platform else ""}
+        FROM `creos` c
+        {join_traffer if platform else ""}
+        WHERE c.{q("creo_date")} >= %s AND c.{q("creo_date")} < %s
+          {buyer_sql}
+          {platform_sql}
+          {clause}
+        GROUP BY DATE(c.{q("creo_date")}), c.{q("creo_name")}
+                 {", t.`platform_name`" if platform else ""}
     """
-    from datetime import timedelta
-    end_exclusive = last + timedelta(days=1)
+    params: list = [first, last + timedelta(days=1)]
+    if buyer_id != "*":
+        params.append(buyer_id)
+    if platform:
+        params.append(platform)
+    params.extend(clause_params)
     with conn.cursor() as cursor:
-        parameters = [first, end_exclusive]
+        cursor.execute(query, params)
+        rows = []
+        for row in cursor.fetchall():
+            variants = int(row.get("budget_variants") or 0)
+            missing = int(row.get("missing_spend_rows") or 0)
+            conflict = variants > 1
+            rows.append({
+                "stat_date": str(row["stat_date"]),
+                "creative_name": row["creative_name"],
+                "platform": _platform_code(row.get("platform_name")) if platform else None,
+                "spend": None if conflict or missing else _number(row.get("spend")),
+                "spend_missing": bool(missing) or conflict,
+                "spend_conflict": conflict,
+                "spend_duplicate": int(row.get("row_count") or 0) > 1,
+            })
+        return rows
+
+
+def _event_rows(conn, buyer_id: str, first: date, last: date,
+                creative: str | None, exact: bool, name_token: str | None,
+                platform: str) -> list[dict]:
+    """Facebook events come from traffers_stat. Telegram events come from the channel table."""
+    from datetime import timedelta
+
+    end = last + timedelta(days=1)
+    buyer_sql = "" if buyer_id == "*" else "AND t.`id`=%s"
+    if platform == "ФБ":
+        clause, clause_params = _creative_clause("s.`creo_name`", creative, exact, name_token)
+        query = f"""
+            SELECT DATE(s.`date`) AS stat_date, s.`creo_name` AS creative_name,
+                   SUM(COALESCE(s.`count_start`,0)) AS starts,
+                   SUM(COALESCE(s.`count_sub`,0)) AS subs,
+                   SUM(COALESCE(s.`count_chat`,0)) AS chats,
+                   SUM(COALESCE(s.`count_reg`,0)) AS regs,
+                   SUM(COALESCE(s.`count_ftd`,0)) AS ftd
+            FROM `traffers_stat` s
+            JOIN `traffers` t ON t.`traffer_name`=s.`traffer_name`
+            WHERE t.`platform_name`=%s
+              AND s.`date`>=%s AND s.`date`<%s
+              AND s.`creo_name` NOT IN (%s, %s)
+              {buyer_sql}
+              {clause}
+            GROUP BY DATE(s.`date`), s.`creo_name`
+        """
+        params: list = [platform, first, end, *PLACEHOLDER_CREATIVES]
+    else:
+        clause, clause_params = _creative_clause("e.`creo_name`", creative, exact, name_token)
+        query = f"""
+            SELECT DATE(e.`date`) AS stat_date, e.`creo_name` AS creative_name,
+                   SUM(COALESCE(e.`count_start`,0)) AS starts,
+                   SUM(COALESCE(e.`count_sub`,0)) AS subs,
+                   SUM(COALESCE(e.`count_reg`,0)) AS regs,
+                   SUM(COALESCE(e.`count_ftd`,0)) AS ftd
+            FROM `buyer_stats_today_start_sub` e
+            JOIN (
+                SELECT DATE(c.`date`) AS stat_date, c.`creo_name` AS creative_name, c.`id_traf`
+                FROM `creos` c
+                JOIN `traffers` t ON t.`id`=c.`id_traf`
+                WHERE t.`platform_name`=%s
+                  AND c.`date`>=%s AND c.`date`<%s
+                  {buyer_sql}
+                GROUP BY DATE(c.`date`), c.`creo_name`, c.`id_traf`
+            ) c ON c.stat_date=DATE(e.`date`) AND c.creative_name=e.`creo_name`
+            WHERE e.`date`>=%s AND e.`date`<%s
+              AND e.`creo_name` NOT IN (%s, %s)
+              {clause}
+            GROUP BY DATE(e.`date`), e.`creo_name`
+        """
+        params = [platform, first, end]
         if buyer_id != "*":
-            parameters.append(buyer_id)
-        if creative:
-            parameters.append(creative)
-        if name_token:
-            parameters.append(name_token)
-        parameters.extend([first, end_exclusive])
-        if creative:
-            parameters.append(creative)
-        if name_token:
-            parameters.append(name_token)
-        if cols["stats_buyer"] and buyer_id != "*":
-            parameters.append(buyer_id)
-        cursor.execute(query, parameters)
+            params.append(buyer_id)
+        params.extend([first, end, *PLACEHOLDER_CREATIVES])
+    if platform == "ФБ" and buyer_id != "*":
+        params.append(buyer_id)
+    params.extend(clause_params)
+    with conn.cursor() as cursor:
+        cursor.execute(query, params)
         rows = []
         for row in cursor.fetchall():
             item = {
-                "stat_date": str(row["stat_date"]), "creative_name": row["creative_name"],
-                "spend_missing": bool(row["missing_spend_rows"]),
-                "spend": _number(row["spend"]),
-                **{metric: _number(row[metric]) for metric in ("starts", "subs", "regs", "ftd")},
+                "stat_date": str(row["stat_date"]),
+                "creative_name": row["creative_name"],
+                "starts": _number(row["starts"]) or 0,
+                "subs": _number(row["subs"]) or 0,
+                "regs": _number(row["regs"]) or 0,
+                "ftd": _number(row["ftd"]) or 0,
             }
-            if cols.get("creo_chats") and cols.get("creo_subs"):
-                item["chats"] = _number(row.get("chats"))
-                item["creo_subs"] = _number(row.get("creo_subs"))
+            if platform == "ФБ":
+                item["chats"] = _number(row.get("chats")) or 0
             rows.append(item)
         return rows
+
+
+def _merge_spend_and_events(spend_rows: list[dict], event_rows: list[dict],
+                            platform: str | None, events_source: str) -> list[dict]:
+    spend_map = {(row["stat_date"], row["creative_name"]): row for row in spend_rows}
+    event_map = {(row["stat_date"], row["creative_name"]): row for row in event_rows}
+    merged = []
+    for key in sorted(set(spend_map) | set(event_map)):
+        spend = spend_map.get(key)
+        event = event_map.get(key)
+        item = {
+            "stat_date": key[0],
+            "creative_name": key[1],
+            "platform": (spend or {}).get("platform") or platform,
+            "events_source": events_source,
+            "spend": spend["spend"] if spend else None,
+            "spend_missing": spend["spend_missing"] if spend else False,
+            "spend_conflict": spend.get("spend_conflict", False) if spend else False,
+            "spend_duplicate": spend["spend_duplicate"] if spend else False,
+            "starts": event["starts"] if event else None,
+            "subs": event["subs"] if event else None,
+            "regs": event["regs"] if event else None,
+            "ftd": event["ftd"] if event else None,
+        }
+        if event and "chats" in event:
+            item["chats"] = event["chats"]
+        merged.append(item)
+    return merged
+
+
+def statistics(conn, buyer_id: str, first: date, last: date,
+               creative: str | None = None, exact: bool = False,
+               name_token: str | None = None) -> list[dict]:
+    """Join spend from creos to the event table of the buyer's platform.
+
+    Facebook events are traffers_stat. Telegram events are
+    buyer_stats_today_start_sub. Both joins use the calendar day and the
+    exact creative name. Repeated creos rows contribute one spend value.
+    A schema without platform_name returns spend only.
+    """
+    if not events_ready(conn):
+        spend_rows = _spend_rows(
+            conn, buyer_id, first, last, creative, exact, name_token, platform=None,
+        )
+        return _merge_spend_and_events(spend_rows, [], None, "not_configured")
+
+    if buyer_id == "*":
+        rows = []
+        for platform, source in (("ФБ", "traffers_stat"), ("ТГ", "buyer_stats_today_start_sub")):
+            spend_rows = _spend_rows(
+                conn, buyer_id, first, last, creative, exact, name_token, platform,
+            )
+            event_rows = _event_rows(
+                conn, buyer_id, first, last, creative, exact, name_token, platform,
+            )
+            rows.extend(_merge_spend_and_events(spend_rows, event_rows, platform, source))
+        return rows
+
+    buyer = _buyer_platform(conn, buyer_id)
+    if not buyer or not buyer["platform"]:
+        return []
+    platform = buyer["platform"]
+    if platform not in ("ФБ", "ТГ"):
+        spend_rows = _spend_rows(
+            conn, buyer_id, first, last, creative, exact, name_token, platform,
+        )
+        return _merge_spend_and_events(
+            spend_rows, [], platform, "postbacks_not_configured",
+        )
+    source = "traffers_stat" if platform == "ФБ" else "buyer_stats_today_start_sub"
+    spend_rows = _spend_rows(
+        conn, buyer_id, first, last, creative, exact, name_token, platform,
+    )
+    event_rows = _event_rows(
+        conn, buyer_id, first, last, creative, exact, name_token, platform,
+    )
+    return _merge_spend_and_events(spend_rows, event_rows, platform, source)
 
 
 def availability(conn, buyer_id: str, first: date, last: date,
@@ -421,16 +583,78 @@ def _columns_for(conn, table: str) -> set[str]:
     return columns
 
 
+def _source_from_joined(
+    conn, buyer_id: str, first: date, last: date, source: str | None,
+    name_token: str | None,
+) -> dict:
+    """Facebook and Telegram rows already joined by statistics()."""
+    rows = statistics(
+        conn, buyer_id, first, last, name_token=name_token,
+    )
+    wanted = _platform_code(source) if source else None
+    if source and not wanted:
+        needle = source.casefold()
+        rows = [
+            row for row in rows
+            if needle in str(row.get("platform") or "").casefold()
+        ]
+    elif wanted:
+        rows = [row for row in rows if row.get("platform") == wanted]
+    shaped = []
+    unattributed = []
+    for row in rows:
+        matched = row.get("starts") is not None and row.get("spend") is not None
+        item = {
+            "stat_date": row["stat_date"],
+            "creative_name": row["creative_name"],
+            "source_id": row.get("platform") or "",
+            "source_type": row.get("platform") or "unknown",
+            "source_name": row.get("platform") or "unknown",
+            "spend": row.get("spend"),
+            "spend_missing": bool(row.get("spend_missing")),
+            "attribution": "exact" if matched else "unmatched",
+            "starts": row.get("starts"),
+            "subs": row.get("subs"),
+            "regs": row.get("regs"),
+            "ftd": row.get("ftd"),
+        }
+        shaped.append(item)
+        if row.get("starts") is not None and row.get("spend") is None:
+            unattributed.append({
+                "stat_date": row["stat_date"],
+                "creative_name": row["creative_name"],
+                "starts": row.get("starts"),
+                "subs": row.get("subs"),
+                "regs": row.get("regs"),
+                "ftd": row.get("ftd"),
+                "reason": "нет затрат с тем же именем креатива и датой",
+            })
+    return {
+        "rows": shaped,
+        "unattributed_events": unattributed,
+        "source_types": sorted({row["source_type"] for row in shaped}),
+        "source_mapping": (
+            "ФБ: события из traffers_stat. ТГ: события из "
+            "buyer_stats_today_start_sub. Затраты только из creos, "
+            "склейка по календарному дню и точному имени креатива."
+        ),
+    }
+
+
 def source_statistics(
     conn, buyer_id: str, first: date, last: date, source: str | None = None,
     name_token: str | None = None,
 ) -> dict:
     """Return source-tagged spend and safely attributable funnel metrics.
 
-    Events table has no id_blog in the current schema. Events are attributed
-    to a source only when a creative/date maps to exactly one source in creos.
-    Ambiguous event rows are returned separately instead of being duplicated.
+    When platform_name exists, Facebook and Telegram use their own event
+    tables. Otherwise only spend is returned: the shared channel table is
+    not treated as the buyer's events.
     """
+    if events_ready(conn):
+        return _source_from_joined(
+            conn, buyer_id, first, last, source, name_token,
+        )
     cols = discover(conn)
     blogger_cols = _columns_for(conn, "bloggers")
     blog_id = quoted(pick(blogger_cols, ("id",), "bloggers"))
@@ -465,17 +689,6 @@ def source_statistics(
                  c.id_blog, b.{blog_type}, b.{blog_name}
         ORDER BY stat_date, source_type, creative_name
     """
-    events_query = f"""
-        SELECT DATE({q("stats_date")}) AS stat_date,
-               {q("stats_name")} AS creative_name,
-               SUM(COALESCE({q("starts")},0)) AS starts,
-               SUM(COALESCE({q("subs")},0)) AS subs,
-               SUM(COALESCE({q("regs")},0)) AS regs,
-               SUM(COALESCE({q("ftd")},0)) AS ftd
-        FROM buyer_stats_today_start_sub
-        WHERE {q("stats_date")} >= %s AND {q("stats_date")} < %s
-        GROUP BY DATE({q("stats_date")}), {q("stats_name")}
-    """
     with conn.cursor() as cursor:
         source_params = ([first, end] if buyer_id == "*" else [buyer_id, first, end])
         if name_token:
@@ -484,8 +697,6 @@ def source_statistics(
             source_params.append(source)
         cursor.execute(source_query, source_params)
         source_rows = cursor.fetchall()
-        # Events have no buyer/source ID. For each creative/date, determine
-        # whether the same name is also used by another buyer or source.
         cursor.execute(
             f"""SELECT DATE({q("creo_date")}) AS stat_date,
                        {q("creo_name")} AS creative_name,
@@ -501,11 +712,8 @@ def source_statistics(
             (int(row["buyer_count"]), int(row["source_count"]))
             for row in cursor.fetchall()
         }
-        cursor.execute(events_query, (first, end))
-        event_rows = {
-            (str(row["stat_date"]), row["creative_name"]): row
-            for row in cursor.fetchall()
-        }
+        # Channel events are not this buyer's events until platform_name exists.
+        event_rows = {}
 
     source_keys: dict[tuple, set[str]] = {}
     for row in source_rows:
@@ -550,7 +758,10 @@ def source_statistics(
         "rows": rows,
         "unattributed_events": unattributed,
         "source_types": sorted({row["source_type"] for row in rows}),
-        "source_mapping": "exact for unique creative/date; ambiguous events are not duplicated",
+        "source_mapping": (
+            "Схема без platform_name: в ответе только затраты. "
+            "События Facebook и Telegram появятся после настройки тех же таблиц."
+        ),
     }
 
 

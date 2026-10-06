@@ -142,21 +142,20 @@ def _tool_result_summary(result: dict) -> str:
 
 SYSTEM = """Ты аналитик TGAds. Сегодня {today}, часовой пояс UTC+02:00.
 Контекст доступа этой группы: {scope_instruction}
-Две базы не смешиваются. Новая воронка (funnel=new) — база lea_partners_db,
-новый чатер: байер NEW_Pavel или NEW_Anastacia, расход в creos.budget,
-события каналов в buyer_stats_today_start_sub. Старая воронка (funnel=old) —
-база leadb, старый чатер. Она есть только у Павла: это весь кабинет Farm
-(id 18), все его креативы без отбора по имени. У Анастасии старой воронки нет.
-Если воронка не указана, у Павла смотри обе (both), у остальных — новую.
-Чаты и подписки с карточки креатива приходят как chats и creo_subs.
-Их не путай с subs из таблицы событий и не складывай метрики двух воронок.
-В новой воронке поле traffer_report — отчёт трафера (traffers_stat): старты,
-подписки, чаты, регистрации и FTD байера за день, без разбивки по креативу.
-Для Павла события каналов по объявлениям Facebook пустые. Если totals.starts
-равен 0, а в traffer_report старты есть, отвечай по отчёту и прямо называй
-first_date–last_date: это не весь запрошенный период, если дни неполные.
-Если старты событий каналов уже ненулевые, не подменяй их отчётом и при
-расхождении покажи оба источника. В старой воронке этого отчёта нет.
+Две базы не смешиваются. Новая воронка (funnel=new) — lea_partners_db.
+Старая (funnel=old) — leadb, только у Павла: весь кабинет Farm (id 18).
+У Анастасии старой воронки нет. Если воронка не указана, у Павла смотри обе,
+у остальных — новую. Не складывай метрики двух воронок.
+Платформа байера — traffers.platform_name.
+Facebook (ФБ): старты, подписки, чаты, регистрации и FTD из traffers_stat.
+Telegram (ТГ): те же события, кроме чатов, из buyer_stats_today_start_sub.
+Затраты и для ФБ, и для ТГ только из creos.budget. Поля creos.chats и
+creos.subs не используй. Склейка — календарный день и точное имя креатива.
+Имена {{tracker.campaign_name}} и {{{{campaign.name}}}} — не креатив.
+Если у строки затрат нет событий или у событий нет затрат, не придумывай
+совпадение и не называй пропуск нулём. Google пока без постбеков: только
+затраты, если они есть. Пока в старой базе нет platform_name и traffers_stat,
+по старой воронке есть только затраты, events_source=not_configured.
 Для каждого вопроса о данных обязательно вызови подходящий
 инструмент: get_overview для итогов, get_funnel для конверсий,
 get_creative для одного креатива, list_creatives для рейтинга или поиска,
@@ -192,16 +191,31 @@ tool_calls одним набором в одном раунде; не жди р�
 сообщением для итогового анализа.
 Если в одном сообщении перечислено несколько вопросов, проверь каждый
 самостоятельно нужным инструментом и ответь на все одним сообщением,
-сохраняя порядок и разделяя ответы по вопросу и автору.
+сохраняя порядок. У каждого раздела строка «Спросил» с telegram_author.
+Если вопрос один, строку «Спросил» не пиши и юзернейм из истории не
+называй.
+Telegram-автор в истории и telegram_author в пачке вопросов — человек,
+который написал в чат. Это не байер и не часть его имени. В строке
+«Байер» пиши только имя из привязки группы и поля buyer. Юзернейм
+спросившего туда не добавляй и через слэш не соединяй.
 Если сообщение не про статистику, слишком общее или без периода/метрик
 (например «тест», «привет»), не вызывай инструменты: коротко попроси
 уточнить вопрос — период и что именно нужно.
 Прошлые ответы в контексте могут устареть: цифры бери только из MySQL.
 Не выдумывай метрики, не делай выводы из малого числа FTD.
 Если записей нет, скажи «нет данных», а не «показатели равны нулю».
-Затраты в creos могут быть пустыми. В таком случае spend=null:
-не объявляй их нулевыми, не делай выводы о цене привлечения и масштабировании
-по этим строкам.
+totals.spend — сумма только заполненных budget. Пустая ячейка в эту сумму
+не входит и нулём не является. Если known_spend больше нуля, назови эту сумму.
+Не пиши, что итоговой суммы нет. Пока cost_* равен null, стоимость привлечения
+не считай и не рекомендуй масштаб по цене старта.
+В ответе за период всегда четыре блока: итог, метрики воронки, что делать
+дальше, проверка отчёта. Проверку бери только из report_checks и spend_gaps.
+Пустые ячейки без стартов — незаполненная сетка, не спрятанный расход:
+назови число и не раздувай список. Отдельно покажи ненулевые проверки:
+старты при пустом budget, два разных budget на один день, повтор строки,
+затраты без события в тот же день. Это повод спросить байера, кто заполнял
+отчёт, а не вывод, что расход украден. Если эти четыре счётчика нулевые,
+напиши, что по ним отчёт чистый.
 Не упоминай названия внутренних инструментов или источника данных в ответе,
 если об этом прямо не спросили.
 Отвечай на русском, оформи итог Markdown с понятными заголовками и списками.
@@ -409,21 +423,37 @@ def parse_date(value: str, today: date) -> date:
 
 
 def summarize(rows: list[dict]) -> dict:
-    result = {metric: round(sum(float(row[metric] or 0) for row in rows), 4)
-              for metric in METRICS if metric != "spend"}
-    missing_spend = any(row.get("spend_missing") or row["spend"] is None for row in rows)
-    result["spend"] = (
-        None if missing_spend else round(sum(float(row["spend"]) for row in rows), 4)
-    )
+    def total(metric: str):
+        values = [row.get(metric) for row in rows]
+        known = [float(value) for value in values if value is not None]
+        if any(value is None for value in values):
+            return None if not known else round(sum(known), 4)
+        return round(sum(known), 4) if known else 0
+
+    result = {metric: total(metric) for metric in ("starts", "subs", "regs", "ftd")}
+    missing_spend = any(row.get("spend_missing") for row in rows)
+    known_spend = [float(row["spend"]) for row in rows if row.get("spend") is not None]
+    if known_spend:
+        result["spend"] = round(sum(known_spend), 4)
+    elif missing_spend or not rows:
+        result["spend"] = None
+    else:
+        result["spend"] = 0
+    incomplete_events = any(row.get("starts") is None for row in rows)
     spend = result["spend"]
     for metric in ("starts", "subs", "regs", "ftd"):
         result[f"cost_{metric}"] = (
-            round(spend / result[metric], 4) if spend is not None and result[metric] else None
+            None if missing_spend or incomplete_events or spend is None
+            or not result[metric]
+            else round(spend / result[metric], 4)
         )
     result["spend_incomplete"] = missing_spend
+    result["events_incomplete"] = incomplete_events
     for metric in ("chats", "creo_subs"):
         if any(metric in row for row in rows):
-            result[metric] = round(sum(float(row.get(metric) or 0) for row in rows), 4)
+            values = [row.get(metric) for row in rows if metric in row]
+            known = [float(value) for value in values if value is not None]
+            result[metric] = round(sum(known), 4) if known else None
     return result
 
 
@@ -437,6 +467,125 @@ def funnel(totals: dict) -> dict:
             if totals[denominator] else None
         )
     return result
+
+
+def spend_gaps(rows: list[dict], limit: int = 15) -> dict | None:
+    """Filled spend stays in totals. This lists the cells that were left out."""
+    missing_rows = [row for row in rows if row.get("spend_missing")]
+    duplicate_rows = [row for row in rows if row.get("spend_duplicate")]
+    unmatched = [
+        row for row in rows
+        if row.get("spend") is not None and row.get("starts") is None
+    ]
+    by_creative: dict[str, list[dict]] = {}
+    for row in rows:
+        by_creative.setdefault(row.get("creative_name") or "", []).append(row)
+    no_filled = sum(
+        all(part.get("spend") is None for part in parts)
+        for parts in by_creative.values()
+    )
+    unmatched_by_name: dict[str, dict] = {}
+    for row in unmatched:
+        item = unmatched_by_name.setdefault(row["creative_name"], {
+            "creative_name": row["creative_name"], "spend": 0.0, "days": 0,
+        })
+        item["spend"] += float(row["spend"])
+        item["days"] += 1
+    ranked = sorted(unmatched_by_name.values(), key=lambda item: -item["spend"])
+    for item in ranked:
+        item["spend"] = round(item["spend"], 4)
+    if not missing_rows and not duplicate_rows and not unmatched and not no_filled:
+        return None
+    known = sum(float(row["spend"]) for row in rows if row.get("spend") is not None)
+    matched = sum(
+        float(row["spend"]) for row in rows
+        if row.get("spend") is not None and row.get("starts") is not None
+    )
+    return {
+        "known_spend": round(known, 4),
+        "matched_same_day_spend": round(matched, 4),
+        "spend_without_same_day_event": round(
+            sum(float(row["spend"]) for row in unmatched), 4
+        ),
+        "channels_without_same_day_event": len(unmatched_by_name),
+        "empty_or_conflicting_budget_rows": len(missing_rows),
+        "duplicate_day_rows": len(duplicate_rows),
+        "creatives_with_no_filled_spend": no_filled,
+        "largest_spend_without_same_day_event": ranked[:limit],
+        "unmatched_list_truncated": len(ranked) > limit,
+    }
+
+
+def _check_examples(rows: list[dict], limit: int, rank) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    for row in rows:
+        item = grouped.setdefault(row["creative_name"], {
+            "creative_name": row["creative_name"],
+            "rows": 0, "spend": 0.0, "starts": 0.0,
+        })
+        item["rows"] += 1
+        if row.get("spend") is not None:
+            item["spend"] += float(row["spend"])
+        if row.get("starts") is not None:
+            item["starts"] += float(row["starts"])
+    ranked = sorted(grouped.values(), key=rank, reverse=True)[:limit]
+    for item in ranked:
+        item["spend"] = round(item["spend"], 4)
+        item["starts"] = round(item["starts"], 4)
+    return ranked
+
+
+def report_checks(rows: list[dict], limit: int = 8) -> dict:
+    """Classify sheet problems. Empty cells without traffic are a blank grid."""
+    empty_with_events = [
+        row for row in rows
+        if row.get("spend_missing") and not row.get("spend_conflict")
+        and (row.get("starts") or 0) > 0
+    ]
+    empty_without_events = [
+        row for row in rows
+        if row.get("spend_missing") and not row.get("spend_conflict")
+        and not (row.get("starts") or 0)
+    ]
+    conflicts = [row for row in rows if row.get("spend_conflict")]
+    duplicates = [row for row in rows if row.get("spend_duplicate")]
+    spend_without_event = [
+        row for row in rows
+        if row.get("spend") is not None and row.get("starts") is None
+    ]
+    return {
+        "empty_budget_without_events": len(empty_without_events),
+        "events_without_budget": {
+            "rows": len(empty_with_events),
+            "starts": round(sum(float(row["starts"]) for row in empty_with_events), 4),
+            "channels": len({row["creative_name"] for row in empty_with_events}),
+            "largest_by_starts": _check_examples(
+                empty_with_events, limit, lambda item: (item["starts"], item["rows"])
+            ),
+        },
+        "conflicting_budgets": {
+            "rows": len(conflicts),
+            "channels": len({row["creative_name"] for row in conflicts}),
+            "examples": _check_examples(
+                conflicts, limit, lambda item: (item["rows"], item["starts"])
+            ),
+        },
+        "duplicate_rows": {
+            "rows": len(duplicates),
+            "channels": len({row["creative_name"] for row in duplicates}),
+            "examples": _check_examples(
+                duplicates, limit, lambda item: (item["spend"], item["rows"])
+            ),
+        },
+        "spend_without_same_day_event": {
+            "rows": len(spend_without_event),
+            "spend": round(sum(float(row["spend"]) for row in spend_without_event), 4),
+            "channels": len({row["creative_name"] for row in spend_without_event}),
+            "largest_by_spend": _check_examples(
+                spend_without_event, limit, lambda item: (item["spend"], item["rows"])
+            ),
+        },
+    }
 
 
 def aggregate_creatives(rows: list[dict], by_date: bool = False) -> list[dict]:
@@ -484,14 +633,24 @@ def source_creative_rows(rows: list[dict]) -> dict[tuple, dict]:
             "source_type": row["source_type"],
             "source_name": row["source_name"],
             "creative_name": row["creative_name"],
-            **{metric: 0 for metric in METRICS},
+            **{metric: 0 for metric in ("starts", "subs", "regs", "ftd")},
+            "spend": 0.0,
             "spend_incomplete": False,
+            "spend_missing": False,
+            "_spend_known": False,
         })
-        item["spend_incomplete"] |= bool(row.get("spend_missing"))
-        for metric in METRICS:
-            item[metric] += float(row[metric] or 0)
+        if row.get("spend") is None or row.get("spend_missing"):
+            item["spend_missing"] = True
+            item["spend_incomplete"] = True
+        else:
+            item["spend"] += float(row["spend"])
+            item["_spend_known"] = True
+        for metric in ("starts", "subs", "regs", "ftd"):
+            value = row.get(metric)
+            if value is not None:
+                item[metric] += float(value)
     for item in result.values():
-        if item["spend_incomplete"]:
+        if not item.pop("_spend_known"):
             item["spend"] = None
     return result
 
@@ -811,29 +970,6 @@ class Analyst:
                         result["cabinet_id"] = query_buyer
                         if name_token:
                             result["creative_name_contains"] = name_token
-                    if self._funnel == "new" and query_buyer != "*":
-                        try:
-                            report = mysql_stats.traffer_report(
-                                conn, current["name"], first, last,
-                            )
-                            if report:
-                                result["traffer_report"] = report
-                        except Exception:
-                            log.exception(
-                                "Traffer report failed buyer=%s", current["name"],
-                            )
-                        if name in ("compare_periods", "find_anomalies"):
-                            try:
-                                second_report = mysql_stats.traffer_report(
-                                    conn, current["name"], second_first, second_last,
-                                )
-                                if second_report:
-                                    result["second_traffer_report"] = second_report
-                            except Exception:
-                                log.exception(
-                                    "Traffer report failed buyer=%s period=second",
-                                    current["name"],
-                                )
                     if name in ("get_source_statistics", "compare_sources"):
                         if name == "get_source_statistics":
                             source_result = mysql_stats.source_statistics(
@@ -872,9 +1008,10 @@ class Analyst:
                                 "unattributed_events": source_result["unattributed_events"],
                                 "source_mapping": source_result["source_mapping"],
                                 "note": (
-                                    "Старты относятся к источнику только если креатив "
-                                    "и дата однозначно связаны с одним источником. "
-                                    "Неоднозначные события вынесены отдельно."
+                                    "ФБ считается по traffers_stat, ТГ по "
+                                    "buyer_stats_today_start_sub. Затраты только из creos. "
+                                    "Строка без пары по дате и точному имени креатива "
+                                    "не достраивается."
                                 ),
                             }
                         first_source = mysql_stats.source_statistics(
@@ -1112,8 +1249,15 @@ class Analyst:
                             }
                             changes = []
                             for creative in before.keys() | after.keys():
-                                baseline = before.get(creative, {}).get(metric, 0)
-                                current_value = after.get(creative, {}).get(metric, 0)
+                                earlier = before.get(creative, {})
+                                later = after.get(creative, {})
+                                if metric == "spend" and (
+                                    earlier.get("spend_incomplete")
+                                    or later.get("spend_incomplete")
+                                ):
+                                    continue
+                                baseline = earlier.get(metric, 0)
+                                current_value = later.get(metric, 0)
                                 if baseline is None or current_value is None or baseline < threshold:
                                     continue
                                 change = (current_value - baseline) / baseline * 100
@@ -1140,11 +1284,16 @@ class Analyst:
                         changes = {}
                         for metric in METRICS:
                             before, after = a[metric], b[metric]
+                            incomplete = metric == "spend" and (
+                                a.get("spend_incomplete") or b.get("spend_incomplete")
+                            )
                             changes[metric] = {
                                 "difference": round(after - before, 4)
-                                if before is not None and after is not None else None,
+                                if not incomplete and before is not None
+                                and after is not None else None,
                                 "percent": round((after - before) / before * 100, 2)
-                                if before is not None and before > 0 and after is not None else None,
+                                if not incomplete and before is not None and before > 0
+                                and after is not None else None,
                             }
                         return {
                             **result, "has_data": True,
@@ -1203,26 +1352,46 @@ class Analyst:
             )
             return {"error": "MySQL недоступен или структура таблиц не поддерживается"}
         if not rows:
-            payload = {**result, "has_data": False, "rows": []}
-            report = payload.get("traffer_report") or {}
-            if report.get("days_count"):
-                payload["has_data"] = True
-                if (report.get("totals") or {}).get("starts"):
-                    payload["starts_source"] = "traffer_report"
-            return payload
+            return {**result, "has_data": False, "rows": []}
+        sources = {row.get("events_source") for row in rows}
+        gaps = spend_gaps(rows)
+        note = (
+            "totals.spend — сумма заполненных budget. "
+            "Пустая ячейка в эту сумму не входит и не является нулём."
+        )
+        if gaps and gaps["known_spend"]:
+            note += (
+                " Покажи эту сумму, spend_gaps и report_checks. "
+                "Не пиши, что итоговой суммы нет. "
+                "Пока cost_* равен null, стоимость привлечения не считай."
+            )
+        elif gaps:
+            note += " Заполненных затрат нет. Пустые ячейки не называй нулём."
+        note += (
+            " report_checks — проверка заполнения, не обвинение. "
+            "Пустые ячейки без стартов не называй скрытым расходом."
+        )
+        if "not_configured" in sources:
+            note += (
+                " В этой базе ещё нет platform_name и traffers_stat. "
+                "События не посчитаны, ниже только затраты."
+            )
+        elif "postbacks_not_configured" in sources:
+            note += " Постбеки этой платформы не настроены. Ниже только затраты."
+        elif any(row.get("starts") is None and row.get("spend") is not None for row in rows):
+            note += (
+                " Часть креативов не совпала по дате и точному имени. "
+                "Их события не подставлены и не считаются нулём."
+            )
         result.update({
             "has_data": True, "totals": funnel(summarize(rows)),
             "creative_count": len({r["creative_name"] for r in rows}),
             "available_dates": sorted({r["stat_date"] for r in rows}),
-            "note": "Если spend=null, данные о расходах неполные; это не нулевые затраты.",
+            "note": note,
         })
-        report_starts = ((result.get("traffer_report") or {}).get("totals") or {}).get("starts") or 0
-        if not (result["totals"].get("starts") or 0) and report_starts:
-            result["starts_source"] = "traffer_report"
-            result["note"] += (
-                " Старты, регистрации и FTD байера за день бери из traffer_report,"
-                " не из totals.starts."
-            )
+        if gaps:
+            result["spend_gaps"] = gaps
+        result["report_checks"] = report_checks(rows)
         if name == "get_funnel":
             return result
         if name == "get_overview":
