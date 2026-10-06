@@ -148,30 +148,37 @@ def test_known_spend_stays_visible_when_other_rows_are_empty():
     rows = [
         {"stat_date": "2026-09-30", "creative_name": "Filled", "spend": 10,
          "spend_missing": False, "starts": 4, "subs": 1, "regs": 0, "ftd": 0},
-        {"stat_date": "2026-09-30", "creative_name": "Empty", "spend": None,
-         "spend_missing": True, "starts": 2, "subs": 1, "regs": 0, "ftd": 0},
+        {"stat_date": "2026-10-01", "creative_name": "Empty", "spend": 0,
+         "spend_missing": False, "starts": 2, "subs": 1, "regs": 0, "ftd": 0},
         {"stat_date": "2026-09-30", "creative_name": "NoEvent", "spend": 3,
          "spend_missing": False, "spend_duplicate": True, "starts": None,
          "subs": None, "regs": None, "ftd": None},
     ]
     result = summarize(rows)
     assert result["spend"] == 13
-    assert result["spend_incomplete"]
-    assert result["events_incomplete"]
-    assert result["cost_starts"] is None
+    assert not result["spend_incomplete"]
+    assert not result["events_incomplete"]
+    assert result["cost_starts"] == round(13 / 6, 4)
     gaps = spend_gaps(rows)
     assert gaps["known_spend"] == 13
     assert gaps["matched_same_day_spend"] == 10
     assert gaps["spend_without_same_day_event"] == 3
-    assert gaps["empty_or_conflicting_budget_rows"] == 1
+    assert gaps["empty_or_conflicting_budget_rows"] == 0
     assert gaps["duplicate_day_rows"] == 1
-    assert gaps["creatives_with_no_filled_spend"] == 1
+    assert gaps["creatives_with_no_filled_spend"] == 0
     assert gaps["largest_spend_without_same_day_event"][0]["creative_name"] == "NoEvent"
     checks = report_checks(rows)
     assert checks["events_without_budget"]["rows"] == 1
     assert checks["events_without_budget"]["starts"] == 2
     assert checks["spend_without_same_day_event"]["spend"] == 3
     assert checks["duplicate_rows"]["rows"] == 1
+    assert checks["duplicate_rows"]["counted_as"] == "one_row"
+    assert checks["duplicate_rows"]["examples"] == [{
+        "stat_date": "2026-09-30",
+        "creative_name": "NoEvent",
+        "spend_kept": 3,
+        "conflict": False,
+    }]
     assert checks["empty_budget_without_events"] == 0
     assert checks["conflicting_budgets"]["rows"] == 0
 
@@ -192,8 +199,8 @@ def test_all_ai_tools_belong_to_bound_buyer(monkeypatch):
     rows = [
         {"stat_date": "2026-09-25", "creative_name": "CreativeA", "spend": 10,
          "spend_missing": False, "starts": 10, "subs": 4, "regs": 2, "ftd": 1},
-        {"stat_date": "2026-09-26", "creative_name": "CreativeA", "spend": None,
-         "spend_missing": True, "starts": 20, "subs": 5, "regs": 3, "ftd": 1},
+        {"stat_date": "2026-09-26", "creative_name": "CreativeA", "spend": 0,
+         "spend_missing": False, "starts": 20, "subs": 5, "regs": 3, "ftd": 1},
         {"stat_date": "2026-09-26", "creative_name": "CreativeB", "spend": 2,
          "spend_missing": False, "starts": 2, "subs": 1, "regs": 0, "ftd": 0},
     ]
@@ -218,15 +225,15 @@ def test_all_ai_tools_belong_to_bound_buyer(monkeypatch):
     base = {"buyer_id": "999", "date_from": "2026-09-26"}
     overview = model.call_tool("get_overview", {**base, "by_day": True})
     assert overview["has_data"] and overview["totals"]["spend"] == 2
-    assert overview["totals"]["spend_incomplete"]
+    assert not overview["totals"]["spend_incomplete"]
     assert overview["totals"]["cost_starts"] is None
-    assert overview["spend_gaps"]["known_spend"] == 2
-    assert overview["spend_gaps"]["empty_or_conflicting_budget_rows"] == 1
-    assert "итоговой суммы нет" in overview["note"]
+    assert overview["totals"]["cost_by_day"] is False
+    assert "неделе или месяцу" in overview["note"]
     assert overview["report_checks"]["events_without_budget"]["starts"] == 20
     assert overview["totals"]["conversion_starts_to_subs"] == 0.2727
     assert len(overview["days"]) == 1
     assert overview["days"][0]["totals"]["spend"] == 2
+    assert overview["days"][0]["totals"]["cost_starts"] is None
     assert model.call_tool("get_funnel", base)["totals"]["regs"] == 3
     creative = model.call_tool(
         "get_creative",
@@ -915,6 +922,42 @@ class ReadyCursor:
 
     def __exit__(self, *_):
         return False
+
+
+def test_empty_budget_is_zero_and_a_conflict_stays_unknown(monkeypatch):
+    monkeypatch.setenv("MYSQL_DATABASE", "lea_partners_db")
+
+    class Cursor(ReadyCursor):
+        def fetchall(self):
+            if "information_schema" in self.last:
+                return [{"COLUMN_NAME": name} for name in READY[self.params[1]]]
+            if "FROM `buyer_stats_today_start_sub`" in self.last:
+                return [{
+                    "stat_date": date(2026, 10, 5), "creative_name": "Late",
+                    "starts": 3, "subs": 1, "regs": 0, "ftd": 0,
+                }]
+            return [
+                {
+                    "stat_date": date(2026, 10, 5), "creative_name": "Late",
+                    "row_count": 1, "budget_variants": 0, "spend": None,
+                    "missing_spend_rows": 1, "platform_name": "ТГ",
+                },
+                {
+                    "stat_date": date(2026, 10, 5), "creative_name": "Split",
+                    "row_count": 2, "budget_variants": 2, "spend": 8,
+                    "missing_spend_rows": 0, "platform_name": "ТГ",
+                },
+            ]
+
+    conn = type("Conn", (), {"schema_name": "lea_partners_db", "cursor": lambda self: Cursor("ТГ")})()
+    rows = {row["creative_name"]: row for row in mysql_stats.statistics(
+        conn, "5", date(2026, 10, 5), date(2026, 10, 5)
+    )}
+    assert rows["Late"]["spend"] == 0
+    assert rows["Late"]["spend_missing"] is False
+    assert rows["Late"]["starts"] == 3
+    assert rows["Split"]["spend"] is None
+    assert rows["Split"]["spend_conflict"] is True
 
 
 def test_facebook_events_come_from_traffers_stat_and_spend_is_not_summed(monkeypatch):

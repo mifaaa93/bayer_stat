@@ -367,14 +367,20 @@ def _spend_rows(conn, buyer_id: str, first: date, last: date,
         rows = []
         for row in cursor.fetchall():
             variants = int(row.get("budget_variants") or 0)
-            missing = int(row.get("missing_spend_rows") or 0)
             conflict = variants > 1
+            # An empty cell is a real zero: spend can stop while starts still arrive.
+            if conflict:
+                spend = None
+            elif variants == 0:
+                spend = 0
+            else:
+                spend = _number(row.get("spend"))
             rows.append({
                 "stat_date": str(row["stat_date"]),
                 "creative_name": row["creative_name"],
                 "platform": _platform_code(row.get("platform_name")) if platform else None,
-                "spend": None if conflict or missing else _number(row.get("spend")),
-                "spend_missing": bool(missing) or conflict,
+                "spend": spend,
+                "spend_missing": conflict,
                 "spend_conflict": conflict,
                 "spend_duplicate": int(row.get("row_count") or 0) > 1,
             })
@@ -469,7 +475,7 @@ def _merge_spend_and_events(spend_rows: list[dict], event_rows: list[dict],
             "creative_name": key[1],
             "platform": (spend or {}).get("platform") or platform,
             "events_source": events_source,
-            "spend": spend["spend"] if spend else None,
+            "spend": spend["spend"] if spend else (0 if event else None),
             "spend_missing": spend["spend_missing"] if spend else False,
             "spend_conflict": spend.get("spend_conflict", False) if spend else False,
             "spend_duplicate": spend["spend_duplicate"] if spend else False,

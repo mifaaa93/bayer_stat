@@ -204,18 +204,21 @@ Telegram-автор в истории и telegram_author в пачке вопр�
 Прошлые ответы в контексте могут устареть: цифры бери только из MySQL.
 Не выдумывай метрики, не делай выводы из малого числа FTD.
 Если записей нет, скажи «нет данных», а не «показатели равны нулю».
-totals.spend — сумма только заполненных budget. Пустая ячейка в эту сумму
-не входит и нулём не является. Если known_spend больше нуля, назови эту сумму.
-Не пиши, что итоговой суммы нет. Пока cost_* равен null, стоимость привлечения
-не считай и не рекомендуй масштаб по цене старта.
+Пустой budget — это ноль, его включай в totals.spend. Два разных budget
+на один день оставляют spend=null: такую сумму не складывай и цену не считай.
+cost_* в totals — стоимость за весь запрошенный период, и только если в нём
+больше одного дня. За один день стоимость не называй: расход и старты падают
+на разные даты. Назови расход и старты этого дня и скажи, что цену видно
+по неделе или месяцу. Края длинного периода чуть смещают цену, это нормально.
 В ответе за период всегда четыре блока: итог, метрики воронки, что делать
-дальше, проверка отчёта. Проверку бери только из report_checks и spend_gaps.
-Пустые ячейки без стартов — незаполненная сетка, не спрятанный расход:
-назови число и не раздувай список. Отдельно покажи ненулевые проверки:
-старты при пустом budget, два разных budget на один день, повтор строки,
-затраты без события в тот же день. Это повод спросить байера, кто заполнял
-отчёт, а не вывод, что расход украден. Если эти четыре счётчика нулевые,
-напиши, что по ним отчёт чистый.
+дальше, проверка отчёта. Старты при нулевом budget — долетевший трафик.
+Расход без стартов в тот же день — старты ещё могут прийти.
+Если duplicate_rows.rows больше нуля, добавь блок «Выявлены дубли».
+Напиши, что дубли не суммировались: на креатив и день взята одна строка.
+Назови байера и перечисли examples: дата, имя креатива, оставленная сумма.
+Если список обрезан, скажи, сколько строк ещё. Попроси исправить эти
+строки в отчёте. Если дублей нет, блок не пиши. Два разных budget на один
+день тоже назови: сумму по ним выбрать нельзя.
 Не упоминай названия внутренних инструментов или источника данных в ответе,
 если об этом прямо не спросили.
 Отвечай на русском, оформи итог Markdown с понятными заголовками и списками.
@@ -439,21 +442,30 @@ def summarize(rows: list[dict]) -> dict:
         result["spend"] = None
     else:
         result["spend"] = 0
-    incomplete_events = any(row.get("starts") is None for row in rows)
+    events_absent = not any(row.get("starts") is not None for row in rows)
     spend = result["spend"]
     for metric in ("starts", "subs", "regs", "ftd"):
         result[f"cost_{metric}"] = (
-            None if missing_spend or incomplete_events or spend is None
+            None if missing_spend or events_absent or spend is None
             or not result[metric]
             else round(spend / result[metric], 4)
         )
     result["spend_incomplete"] = missing_spend
-    result["events_incomplete"] = incomplete_events
+    result["events_incomplete"] = events_absent
     for metric in ("chats", "creo_subs"):
         if any(metric in row for row in rows):
             values = [row.get(metric) for row in rows if metric in row]
             known = [float(value) for value in values if value is not None]
             result[metric] = round(sum(known), 4) if known else None
+    return result
+
+
+def hide_daily_cost(totals: dict) -> dict:
+    """Same-day price mixes spend with starts that arrive on other days."""
+    result = dict(totals)
+    for metric in ("starts", "subs", "regs", "ftd"):
+        result[f"cost_{metric}"] = None
+    result["cost_by_day"] = False
     return result
 
 
@@ -535,16 +547,35 @@ def _check_examples(rows: list[dict], limit: int, rank) -> list[dict]:
     return ranked
 
 
+def _duplicate_examples(rows: list[dict], limit: int) -> list[dict]:
+    items = [
+        {
+            "stat_date": row["stat_date"],
+            "creative_name": row["creative_name"],
+            "spend_kept": row.get("spend"),
+            "conflict": bool(row.get("spend_conflict")),
+        }
+        for row in rows
+    ]
+    items.sort(key=lambda item: (
+        item["spend_kept"] is None,
+        -(item["spend_kept"] or 0),
+        item["stat_date"],
+        item["creative_name"],
+    ))
+    return items[:limit]
+
+
 def report_checks(rows: list[dict], limit: int = 8) -> dict:
     """Classify sheet problems. Empty cells without traffic are a blank grid."""
     empty_with_events = [
         row for row in rows
-        if row.get("spend_missing") and not row.get("spend_conflict")
+        if row.get("spend") == 0 and not row.get("spend_conflict")
         and (row.get("starts") or 0) > 0
     ]
     empty_without_events = [
         row for row in rows
-        if row.get("spend_missing") and not row.get("spend_conflict")
+        if row.get("spend") == 0 and not row.get("spend_conflict")
         and not (row.get("starts") or 0)
     ]
     conflicts = [row for row in rows if row.get("spend_conflict")]
@@ -573,9 +604,9 @@ def report_checks(rows: list[dict], limit: int = 8) -> dict:
         "duplicate_rows": {
             "rows": len(duplicates),
             "channels": len({row["creative_name"] for row in duplicates}),
-            "examples": _check_examples(
-                duplicates, limit, lambda item: (item["spend"], item["rows"])
-            ),
+            "counted_as": "one_row",
+            "examples": _duplicate_examples(duplicates, limit),
+            "list_truncated": len(duplicates) > limit,
         },
         "spend_without_same_day_event": {
             "rows": len(spend_without_event),
@@ -1280,7 +1311,12 @@ class Analyst:
                                     "причины. Неполные затраты исключены."
                                 ),
                             }
-                        a, b = funnel(summarize(first_rows)), funnel(summarize(second_rows))
+                        a = funnel(summarize(first_rows))
+                        b = funnel(summarize(second_rows))
+                        if first == last:
+                            a = hide_daily_cost(a)
+                        if second_first == second_last:
+                            b = hide_daily_cost(b)
                         changes = {}
                         for metric in METRICS:
                             before, after = a[metric], b[metric]
@@ -1355,22 +1391,19 @@ class Analyst:
             return {**result, "has_data": False, "rows": []}
         sources = {row.get("events_source") for row in rows}
         gaps = spend_gaps(rows)
-        note = (
-            "totals.spend — сумма заполненных budget. "
-            "Пустая ячейка в эту сумму не входит и не является нулём."
-        )
-        if gaps and gaps["known_spend"]:
+        checks = report_checks(rows)
+        single_day = first == last
+        note = "Пустой budget входит в totals.spend как ноль."
+        if single_day:
             note += (
-                " Покажи эту сумму, spend_gaps и report_checks. "
-                "Не пиши, что итоговой суммы нет. "
-                "Пока cost_* равен null, стоимость привлечения не считай."
+                " Период один день: cost_* не используй. "
+                "Назови расход и старты и скажи, что цену видно по неделе или месяцу."
             )
-        elif gaps:
-            note += " Заполненных затрат нет. Пустые ячейки не называй нулём."
-        note += (
-            " report_checks — проверка заполнения, не обвинение. "
-            "Пустые ячейки без стартов не называй скрытым расходом."
-        )
+        else:
+            note += (
+                " cost_* в totals — цена за весь период. "
+                "По дням цену не называй: старты долетают в другие дни."
+            )
         if "not_configured" in sources:
             note += (
                 " В этой базе ещё нет platform_name и traffers_stat. "
@@ -1380,18 +1413,27 @@ class Analyst:
             note += " Постбеки этой платформы не настроены. Ниже только затраты."
         elif any(row.get("starts") is None and row.get("spend") is not None for row in rows):
             note += (
-                " Часть креативов не совпала по дате и точному имени. "
-                "Их события не подставлены и не считаются нулём."
+                " Часть расхода приходится на день без стартов. "
+                "В цену периода этот расход входит, по одному дню его не дели."
             )
+        if checks["duplicate_rows"]["rows"]:
+            note += (
+                " Есть дубли. Добавь блок «Выявлены дубли»: байер, дата, "
+                "креатив и оставленная сумма. Дубли не суммируй и попроси "
+                "исправить их в отчёте."
+            )
+        totals = funnel(summarize(rows))
+        if single_day:
+            totals = hide_daily_cost(totals)
         result.update({
-            "has_data": True, "totals": funnel(summarize(rows)),
+            "has_data": True, "totals": totals,
             "creative_count": len({r["creative_name"] for r in rows}),
             "available_dates": sorted({r["stat_date"] for r in rows}),
             "note": note,
         })
         if gaps:
             result["spend_gaps"] = gaps
-        result["report_checks"] = report_checks(rows)
+        result["report_checks"] = checks
         if name == "get_funnel":
             return result
         if name == "get_overview":
@@ -1400,7 +1442,7 @@ class Analyst:
                 for row in rows:
                     grouped_days.setdefault(row["stat_date"], []).append(row)
                 days = [
-                    {"date": day, "totals": funnel(summarize(day_rows))}
+                    {"date": day, "totals": hide_daily_cost(funnel(summarize(day_rows)))}
                     for day, day_rows in sorted(grouped_days.items())
                 ]
                 result.update({"days": days[-31:], "truncated": len(days) > 31})
@@ -1411,15 +1453,20 @@ class Analyst:
                 return {**result, "requires_disambiguation": True,
                         "matches": candidates[:25], "truncated": len(candidates) > 25,
                         "totals": None}
-            days = aggregate_creatives(rows, by_date=True)
+            days = [
+                hide_daily_cost(item)
+                for item in aggregate_creatives(rows, by_date=True)
+            ]
             result.update({
                 "creative_name": candidates[0],
                 "days": days[-40:] if args.get("by_day") else [],
                 "truncated": bool(args.get("by_day") and len(days) > 40),
             })
             return result
-        items = aggregate_creatives(rows, by_date=bool(args.get("by_date", False))
-                                    if name == "get_statistics" else False)
+        by_date = bool(args.get("by_date", False)) if name == "get_statistics" else False
+        items = aggregate_creatives(rows, by_date=by_date)
+        if by_date:
+            items = [hide_daily_cost(item) for item in items]
         if name == "list_creatives":
             minimum = max(0, int(args.get("min_starts") or 0))
             items = [item for item in items if item["starts"] >= minimum]
