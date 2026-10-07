@@ -21,7 +21,8 @@ ACTIVE_FUNNEL = contextvars.ContextVar("bayer_mysql_funnel", default="new")
 # Pavel in the old funnel is the whole Farm cabinet (leadb traffer id 18).
 SELECTABLE_IDS = ("1", "5")
 OLD_FUNNEL = {
-    "1": {"buyer_id": "18", "cabinet": "Farm"},
+    # Farm is the cabinet in traffers. Its tracker rows are stored as Pavel.
+    "1": {"buyer_id": "18", "cabinet": "Farm", "event_name": "Pavel"},
 }
 
 
@@ -387,6 +388,14 @@ def _spend_rows(conn, buyer_id: str, first: date, last: date,
         return rows
 
 
+def _stat_traffer_name(buyer_id: str) -> str | None:
+    """Tracker name for a cabinet whose traffers.traffer_name differs from it."""
+    for link in OLD_FUNNEL.values():
+        if link["buyer_id"] == str(buyer_id):
+            return link.get("event_name")
+    return None
+
+
 def _event_rows(conn, buyer_id: str, first: date, last: date,
                 creative: str | None, exact: bool, name_token: str | None,
                 platform: str) -> list[dict]:
@@ -395,8 +404,16 @@ def _event_rows(conn, buyer_id: str, first: date, last: date,
 
     end = last + timedelta(days=1)
     buyer_sql = "" if buyer_id == "*" else "AND t.`id`=%s"
+    event_name = None
     if platform == "ФБ":
         clause, clause_params = _creative_clause("s.`creo_name`", creative, exact, name_token)
+        event_name = None if buyer_id == "*" else _stat_traffer_name(buyer_id)
+        if event_name:
+            identity_sql = "JOIN `traffers` t ON t.`id`=%s"
+            name_sql = "AND s.`traffer_name`=%s"
+        else:
+            identity_sql = "JOIN `traffers` t ON t.`traffer_name`=s.`traffer_name`"
+            name_sql = ""
         query = f"""
             SELECT DATE(s.`date`) AS stat_date, s.`creo_name` AS creative_name,
                    SUM(COALESCE(s.`count_start`,0)) AS starts,
@@ -405,15 +422,20 @@ def _event_rows(conn, buyer_id: str, first: date, last: date,
                    SUM(COALESCE(s.`count_reg`,0)) AS regs,
                    SUM(COALESCE(s.`count_ftd`,0)) AS ftd
             FROM `traffers_stat` s
-            JOIN `traffers` t ON t.`traffer_name`=s.`traffer_name`
+            {identity_sql}
             WHERE t.`platform_name`=%s
+              {name_sql}
               AND s.`date`>=%s AND s.`date`<%s
               AND s.`creo_name` NOT IN (%s, %s)
-              {buyer_sql}
+              {"" if event_name else buyer_sql}
               {clause}
             GROUP BY DATE(s.`date`), s.`creo_name`
         """
-        params: list = [platform, first, end, *PLACEHOLDER_CREATIVES]
+        params: list = [buyer_id] if event_name else []
+        params.append(platform)
+        if event_name:
+            params.append(event_name)
+        params.extend([first, end, *PLACEHOLDER_CREATIVES])
     else:
         clause, clause_params = _creative_clause("e.`creo_name`", creative, exact, name_token)
         query = f"""
@@ -441,7 +463,7 @@ def _event_rows(conn, buyer_id: str, first: date, last: date,
         if buyer_id != "*":
             params.append(buyer_id)
         params.extend([first, end, *PLACEHOLDER_CREATIVES])
-    if platform == "ФБ" and buyer_id != "*":
+    if platform == "ФБ" and buyer_id != "*" and not event_name:
         params.append(buyer_id)
     params.extend(clause_params)
     with conn.cursor() as cursor:

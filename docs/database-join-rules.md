@@ -2,7 +2,7 @@
 
 Правила подтверждены разработчиком базы 5 октября 2026. Бот считает по ним с этой даты.
 
-Обе базы остаются. Новая `lea_partners_db` уже устроена так. Старая `leadb` получит те же таблицы и те же правила, когда их заведут. До этого по старой воронке бот показывает только затраты.
+Обе базы остаются. Новая `lea_partners_db` и старая `leadb` читаются по одним правилам. В старой базе кабинет Farm (id 18) в `traffers_stat` подписан как Pavel.
 
 ## Платформа
 
@@ -20,7 +20,7 @@
 
 День в базе — календарный день. `creo_name` — имя креатива.
 
-Facebook: `traffers_stat` и `creos` по дню и точному `creo_name`. Байер находится так: `traffers_stat.traffer_name` → `traffers.id` → `creos.id_traf`, и `platform_name = ФБ`.
+Facebook: `traffers_stat` и `creos` по дню и точному `creo_name`. Байер находится так: `traffers_stat.traffer_name` → `traffers.id` → `creos.id_traf`, и `platform_name = ФБ`. Для кабинета Farm имя в `traffers_stat` — Pavel.
 
 Telegram: `buyer_stats_today_start_sub` и `creos` по дню и точному `creo_name`. Байер — `creos.id_traf = traffers.id`, и `platform_name = ТГ`.
 
@@ -34,4 +34,4 @@ Telegram: `buyer_stats_today_start_sub` и `creos` по дню и точному
 
 ## Что делает бот, пока старая база не готова
 
-В `leadb` нет `platform_name` и нет `traffers_stat`. Запрос по старой воронке возвращает затраты из `creos` и помечает события как `not_configured`. Общая лента `buyer_stats_today_start_sub` к байеру старой воронки не приклеивается: с сентября она совпадает с новой базой, и сумма двух баз удваивает Telegram.
+В `leadb` есть `platform_name` и `traffers_stat` с теми же полями, что в новой базе. У Farm платформа ФБ, поэтому события старой воронки берутся из `traffers_stat`, а не из `buyer_stats_today_start_sub`. Эта лента по-прежнему не клеится к Farm: с сентября она совпадает с новой базой и удваивает Telegram. `organic` ни к какому байеру не относится.

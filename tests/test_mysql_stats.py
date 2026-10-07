@@ -972,10 +972,25 @@ def test_facebook_events_come_from_traffers_stat_and_spend_is_not_summed(monkeyp
     assert rows[0]["spend_duplicate"]
     joined = "\n".join(cursor.calls)
     assert "FROM `traffers_stat`" in joined
+    assert "t.`traffer_name`=s.`traffer_name`" in joined
+    assert "Pavel" not in cursor.params
     assert "buyer_stats_today_start_sub" not in joined
     assert "MAX(CAST" in joined
     assert "{tracker.campaign_name}" in cursor.params
     assert "{{campaign.name}}" in cursor.params
+
+
+def test_old_farm_events_use_pavel_name(monkeypatch):
+    monkeypatch.setenv("MYSQL_DATABASE", "leadb")
+    cursor = ReadyCursor("ФБ")
+    conn = type("Conn", (), {"schema_name": "leadb", "cursor": lambda self: cursor})()
+    rows = mysql_stats.statistics(conn, "18", date(2026, 10, 5), date(2026, 10, 7))
+    assert rows[0]["events_source"] == "traffers_stat"
+    joined = "\n".join(cursor.calls)
+    assert "s.`traffer_name`=%s" in joined
+    assert "t.`traffer_name`=s.`traffer_name`" not in joined
+    assert cursor.params.count("Pavel") == 1
+    assert cursor.params.count("18") == 1
 
 
 def test_telegram_events_come_from_channel_table(monkeypatch):
