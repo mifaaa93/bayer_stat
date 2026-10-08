@@ -273,7 +273,7 @@ def test_all_ai_tools_belong_to_bound_buyer(monkeypatch):
 
 def test_tool_schemas_are_unique_and_scope_buyer_selection():
     names = [item["function"]["name"] for item in TOOLS]
-    assert len(names) == len(set(names)) == 16
+    assert len(names) == len(set(names)) == 17
     assert {"get_creative", "compare_periods", "get_funnel",
             "get_data_availability", "find_anomalies",
             "list_available_buyers", "get_buyer_statistics",
@@ -958,6 +958,67 @@ def test_empty_budget_is_zero_and_a_conflict_stays_unknown(monkeypatch):
     assert rows["Late"]["starts"] == 3
     assert rows["Split"]["spend"] is None
     assert rows["Split"]["spend_conflict"] is True
+
+
+def test_find_user_uses_telegram_id_and_stays_in_allowed_funnel(monkeypatch):
+    class LookupCursor:
+        def execute(self, sql, params=()):
+            self.sql = sql
+            self.params = params
+
+        def fetchall(self):
+            return [{
+                "uid": "555", "tg_id": "777", "reg_date": "2026-10-01",
+                "ftd_date": None, "ftd_sum": None, "balance": Decimal("1.5"),
+                "deps": None, "deps_count": None, "withdrawals": None,
+                "withdrawals_count": None, "activity_date": None,
+                "country": "SA", "report": None, "prev_report": None,
+            }]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+    cursor = LookupCursor()
+    conn = type("Conn", (), {"cursor": lambda self: cursor})()
+    from decimal import Decimal
+    found = mysql_stats.find_traders(conn, "777")
+    assert found[0]["matched_fields"] == ["telegram_id"]
+    assert found[0]["country"] == "SA"
+    assert found[0]["balance"] == 1.5
+    assert "Facebook" not in cursor.sql
+    assert cursor.params[:2] == ("777", "777")
+    assert mysql_stats.find_traders(conn, "abc") == []
+
+    seen = []
+
+    class Context:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_):
+            return False
+
+    def lookup(conn, user_id):
+        seen.append(mysql_stats.ACTIVE_FUNNEL.get())
+        return []
+
+    monkeypatch.setenv("MYSQL_DATABASE", "lea_partners_db")
+    monkeypatch.setenv("MYSQL_DATABASE_OLD", "leadb")
+    monkeypatch.setattr(mysql_stats, "connection", lambda: Context())
+    monkeypatch.setattr(mysql_stats, "find_traders", lookup)
+    anastacia = Analyst("5", "NEW_Anastacia", "key", "model", "https://example.test/v1")
+    result = anastacia.call_tool("find_user", {"user_id": "777"})
+    assert result["has_data"] is False
+    assert seen == ["new"]
+    refused = anastacia.call_tool("find_user", {"user_id": "777", "funnel": "old"})
+    assert "только новая" in refused["error"]
+    assert anastacia.call_tool("find_user", {"user_id": "tg777"})["error"]
+    pavel = Analyst("1", "NEW_Pavel", "key", "model", "https://example.test/v1")
+    pavel.call_tool("find_user", {"user_id": "777"})
+    assert seen == ["new", "new", "old"]
 
 
 def test_facebook_events_come_from_traffers_stat_and_spend_is_not_summed(monkeypatch):

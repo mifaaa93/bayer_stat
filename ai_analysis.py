@@ -161,7 +161,10 @@ events_source=not_configured и в ответе только затраты.
 инструмент: get_overview для итогов, get_funnel для конверсий,
 get_creative для одного креатива, list_creatives для рейтинга или поиска,
 compare_periods или compare_creatives для сравнения и
-find_anomalies для резких изменений, get_data_availability для покрытия дат.
+find_anomalies для резких изменений, get_data_availability для покрытия дат,
+find_user для человека по Telegram ID или uid трейдера.
+Отдельного Facebook ID в базе нет. У найденного человека нет байера,
+креатива и кампании: не придумывай источник.
 get_source_statistics для статистики по ТГ/фб и другим источникам,
 compare_sources для сравнения источников и периодов.
 get_country_statistics для регистраций и FTD по странам, креативам и источникам;
@@ -366,6 +369,15 @@ TOOLS.extend([
           "source": {"type": "string", "description": "ТГ или фб"},
           "limit": {"type": "integer", "minimum": 1, "maximum": 50}},
          ["first_from", "first_to", "second_from", "second_to"]),
+    tool("find_user",
+         "Найти трейдера по Telegram ID или uid в users_stat. "
+         "Отдельного Facebook ID в базе нет. Дата не нужна. "
+         "У строки нет байера, креатива и кампании.",
+         {"user_id": {
+             "type": "string",
+             "description": "Telegram ID или uid трейдера, только цифры",
+         }},
+         ["user_id"]),
     tool("find_anomalies",
          "Ищи резкие изменения по креативам между двумя периодами. "
          "Не интерпретируй малые выборки как статистически значимые.",
@@ -409,6 +421,7 @@ TOOL_PROGRESS = {
     "list_creatives": "Изучаю креативы",
     "compare_periods": "Сравниваю периоды",
     "compare_creatives": "Сравниваю креативы",
+    "find_user": "Ищу пользователя",
     "find_anomalies": "Проверяю изменения",
     "get_data_availability": "Проверяю доступные данные",
     "get_source_statistics": "Сравниваю источники",
@@ -835,6 +848,50 @@ class Analyst:
             except Exception:
                 log.exception("Could not select buyer for tool name=%s", name)
                 return {"error": "Не удалось получить данные выбранного байера"}
+        if name == "find_user":
+            user_id = str(args.get("user_id") or "").strip()
+            if not user_id.isdigit():
+                return {
+                    "error": "Нужен числовой Telegram ID или uid трейдера. "
+                             "Отдельного Facebook ID в базе нет."
+                }
+            if self.buyer_id == "*":
+                allowed = ("new", "old")
+            else:
+                allowed = mysql_stats.allowed_funnels(self.buyer_id)
+            requested = str(args.get("funnel") or "").strip().lower()
+            if not requested:
+                requested = "both" if "old" in allowed else "new"
+            if requested == "both":
+                funnels = tuple(item for item in ("new", "old") if item in allowed)
+            elif requested in allowed:
+                funnels = (requested,)
+            else:
+                return {"error": "Для этого байера доступна только новая воронка"}
+            matches = []
+            try:
+                for funnel_name in funnels:
+                    with mysql_stats.use_funnel(funnel_name):
+                        with mysql_stats.connection() as conn:
+                            for row in mysql_stats.find_traders(conn, user_id):
+                                matches.append({
+                                    **row,
+                                    "funnel": funnel_name,
+                                    "database": mysql_stats.database_name(funnel_name),
+                                })
+            except Exception:
+                log.exception("User lookup failed")
+                return {"error": "Не удалось найти пользователя"}
+            return {
+                "has_data": bool(matches),
+                "query": user_id,
+                "matches": matches,
+                "note": (
+                    "Точное совпадение tg_id или uid в users_stat. "
+                    "Отдельного Facebook ID в базе нет. "
+                    "У человека нет байера, креатива и кампании."
+                ),
+            }
         if name == "list_available_buyers":
             if self.buyer_id != "*":
                 return {"error": "В этой группе доступен только привязанный байер"}

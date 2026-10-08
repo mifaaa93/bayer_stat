@@ -258,6 +258,54 @@ def traffer_report(conn, buyer_name: str, first: date, last: date) -> dict | Non
     }
 
 
+def find_traders(conn, user_id: str, limit: int = 20) -> list[dict]:
+    """Exact match of a Telegram id or trader uid. There is no Facebook user id."""
+    user_id = str(user_id).strip()
+    if not user_id.isdigit() or len(user_id) > 32:
+        return []
+    limit = max(1, min(int(limit), 20))
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT `uid`, `tg_id`, `reg_date`, `ftd_date`, `ftd_sum`, `balance`,
+                   `deps`, `deps_count`, `withdrawals`, `withdrawals_count`,
+                   `activity_date`, `country`, `report`, `prev_report`
+            FROM `users_stat`
+            WHERE TRIM(`uid`)=%s OR TRIM(`tg_id`)=%s
+            LIMIT %s
+            """,
+            (user_id, user_id, limit),
+        )
+        found = cursor.fetchall()
+    rows = []
+    for row in found:
+        uid = "" if row.get("uid") is None else str(row["uid"]).strip()
+        tg_id = "" if row.get("tg_id") is None else str(row["tg_id"]).strip()
+        matched = []
+        if tg_id == user_id:
+            matched.append("telegram_id")
+        if uid == user_id:
+            matched.append("uid")
+        rows.append({
+            "uid": uid or None,
+            "telegram_id": tg_id or None,
+            "matched_fields": matched,
+            "reg_date": None if row.get("reg_date") is None else str(row["reg_date"]),
+            "ftd_date": None if row.get("ftd_date") is None else str(row["ftd_date"]),
+            "ftd_sum": _number(row.get("ftd_sum")),
+            "balance": _number(row.get("balance")),
+            "deposits_sum": _number(row.get("deps")),
+            "deposits_count": _number(row.get("deps_count")),
+            "withdrawals_sum": _number(row.get("withdrawals")),
+            "withdrawals_count": _number(row.get("withdrawals_count")),
+            "activity_date": None if row.get("activity_date") is None else str(row["activity_date"]),
+            "country": None if row.get("country") is None else str(row["country"]),
+            "report": None if row.get("report") is None else str(row["report"]),
+            "prev_report": None if row.get("prev_report") is None else str(row["prev_report"]),
+        })
+    return rows
+
+
 def _number(value):
     if value is None:
         return None
