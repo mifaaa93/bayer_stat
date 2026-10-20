@@ -2,11 +2,12 @@ from datetime import date
 from unittest.mock import Mock, patch
 
 import pytest
+import requests
 
 import mysql_stats
 from ai_analysis import (
-    CLARIFY_QUESTION, Analyst, TOOL_PROGRESS, TOOLS, parse_date, report_checks,
-    spend_gaps, summarize,
+    CLARIFY_QUESTION, Analyst, LLM_RETRY_ATTEMPTS, TOOL_PROGRESS, TOOLS,
+    llm_transient_error, parse_date, report_checks, spend_gaps, summarize,
 )
 
 
@@ -479,6 +480,57 @@ def test_tool_request_enables_parallel_calls():
     assert payload["parallel_tool_calls"] is True
 
 
+def _http_error(status: int, retry_after: str | None = None):
+    response = Mock()
+    response.status_code = status
+    response.headers = {} if retry_after is None else {"Retry-After": retry_after}
+    error = requests.HTTPError(f"{status} error", response=response)
+    error.response = response
+    response.raise_for_status.side_effect = error
+    return response
+
+
+def test_llm_request_retries_503_then_succeeds(monkeypatch):
+    model = Analyst("5", "Buyer", "key", "model", "https://example.test/v1")
+    ok = Mock()
+    ok.status_code = 200
+    ok.raise_for_status.return_value = None
+    retries = []
+    monkeypatch.setattr("ai_analysis.time.sleep", lambda seconds: retries.append(seconds))
+    with patch("ai_analysis.requests.post", side_effect=[_http_error(503), ok]) as request:
+        result = model._request(
+            [{"role": "user", "content": "test"}],
+            on_retry=lambda attempt, total, status: retries.append((attempt, total, status)),
+        )
+    assert result is ok
+    assert request.call_count == 2
+    assert (1, LLM_RETRY_ATTEMPTS, 503) in retries
+    assert any(isinstance(item, float) for item in retries)
+
+
+def test_llm_request_does_not_retry_client_errors(monkeypatch):
+    model = Analyst("5", "Buyer", "key", "model", "https://example.test/v1")
+    monkeypatch.setattr("ai_analysis.time.sleep", lambda *_: None)
+    with patch("ai_analysis.requests.post", return_value=_http_error(400)) as request:
+        with pytest.raises(requests.HTTPError):
+            model._request([{"role": "user", "content": "test"}])
+    assert request.call_count == 1
+    assert llm_transient_error(requests.Timeout()) is True
+    assert llm_transient_error(requests.HTTPError("400")) is False
+
+
+def test_llm_request_gives_up_after_retries(monkeypatch):
+    model = Analyst("5", "Buyer", "key", "model", "https://example.test/v1")
+    monkeypatch.setattr("ai_analysis.time.sleep", lambda *_: None)
+    with patch(
+        "ai_analysis.requests.post",
+        side_effect=[_http_error(503), _http_error(502), _http_error(503)],
+    ) as request:
+        with pytest.raises(requests.HTTPError):
+            model._request([{"role": "user", "content": "test"}])
+    assert request.call_count == 1 + LLM_RETRY_ATTEMPTS
+
+
 def test_service_tier_is_forwarded_when_configured(monkeypatch):
     model = Analyst("5", "Buyer", "key", "model", "https://example.test/v1")
     response = Mock()
@@ -610,7 +662,9 @@ def test_final_answer_is_non_streaming():
     }
     with patch.object(analyst, "_request", return_value=response) as request:
         assert analyst._final([{"role": "user", "content": "test"}]) == "готово"
-    request.assert_called_once_with([{"role": "user", "content": "test"}], stream=False)
+    request.assert_called_once_with(
+        [{"role": "user", "content": "test"}], stream=False, on_retry=None,
+    )
 
 
 def test_tool_batch_callback_runs_after_all_results():

@@ -243,6 +243,33 @@ Keitaro и Chatter.
 
 # Telegram rich messages allow 32768 UTF-8 characters. Plain text stays at 4096.
 RICH_ANSWER_LIMIT = 32768
+LLM_RETRY_ATTEMPTS = 2
+LLM_RETRY_DELAY = 2.0
+LLM_RETRY_STATUSES = {429, 500, 502, 503, 504}
+LLM_RETRY_MAX_WAIT = 15.0
+
+
+def _llm_status(exc: BaseException) -> int | None:
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None)
+
+
+def llm_transient_error(exc: BaseException) -> bool:
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return True
+    status = _llm_status(exc)
+    return status in LLM_RETRY_STATUSES
+
+
+def _llm_retry_wait(exc: BaseException, attempt: int) -> float:
+    response = getattr(exc, "response", None)
+    header = None if response is None else response.headers.get("Retry-After")
+    if header:
+        try:
+            return min(max(float(header), 1.0), LLM_RETRY_MAX_WAIT)
+        except (TypeError, ValueError):
+            pass
+    return min(LLM_RETRY_DELAY * attempt, LLM_RETRY_MAX_WAIT)
 
 CLARIFY_QUESTION = (
     "Уточните вопрос: укажите период и что нужно "
@@ -1707,7 +1734,7 @@ class Analyst:
         messages.append({"role": "user", "content": question[:12000]})
         return messages
 
-    def _request(self, messages, stream=False, tools=False):
+    def _request(self, messages, stream=False, tools=False, on_retry=None):
         payload = {"model": self.model, "messages": messages, "temperature": 0.1}
         if tools:
             payload.update({
@@ -1721,35 +1748,60 @@ class Analyst:
             payload["reasoning_effort"] = self.reasoning_effort
         if SERVICE_TIER:
             payload["service_tier"] = SERVICE_TIER
-        started = time.monotonic()
-        log.info(
-            "LLM request model=%s tools=%s stream=%s reasoning=%s messages=%s buyer_id=%s",
-            self.model, tools, stream, self.reasoning_effort, len(messages),
-            self.buyer_id,
-        )
-        try:
-            response = requests.post(
-                self.base_url + "/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json=payload, stream=stream, timeout=90,
+        attempts = 1 + LLM_RETRY_ATTEMPTS
+        last_error: BaseException | None = None
+        for attempt in range(1, attempts + 1):
+            started = time.monotonic()
+            log.info(
+                "LLM request model=%s tools=%s stream=%s reasoning=%s "
+                "messages=%s buyer_id=%s attempt=%s/%s",
+                self.model, tools, stream, self.reasoning_effort, len(messages),
+                self.buyer_id, attempt, attempts,
             )
-            response.raise_for_status()
-        except requests.RequestException:
-            log.exception(
-                "LLM request failed model=%s tools=%s stream=%s elapsed=%.2fs",
-                self.model, tools, stream, time.monotonic() - started,
+            try:
+                response = requests.post(
+                    self.base_url + "/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json=payload, stream=stream, timeout=90,
+                )
+                response.raise_for_status()
+            except requests.RequestException as exc:
+                last_error = exc
+                elapsed = time.monotonic() - started
+                if not llm_transient_error(exc) or attempt == attempts:
+                    log.exception(
+                        "LLM request failed model=%s tools=%s stream=%s "
+                        "elapsed=%.2fs attempt=%s/%s",
+                        self.model, tools, stream, elapsed, attempt, attempts,
+                    )
+                    raise
+                wait = _llm_retry_wait(exc, attempt)
+                log.warning(
+                    "LLM request retry model=%s tools=%s stream=%s "
+                    "elapsed=%.2fs attempt=%s/%s wait=%.1fs error=%s",
+                    self.model, tools, stream, elapsed, attempt, attempts,
+                    wait, exc,
+                )
+                if on_retry:
+                    try:
+                        on_retry(attempt, LLM_RETRY_ATTEMPTS, _llm_status(exc))
+                    except Exception:
+                        log.debug("LLM retry status callback failed", exc_info=True)
+                time.sleep(wait)
+                continue
+            log.info(
+                "LLM response status=%s tools=%s stream=%s elapsed=%.2fs",
+                response.status_code, tools, stream, time.monotonic() - started,
             )
-            raise
-        log.info(
-            "LLM response status=%s tools=%s stream=%s elapsed=%.2fs",
-            response.status_code, tools, stream, time.monotonic() - started,
-        )
-        return response
+            return response
+        assert last_error is not None
+        raise last_error
 
     def _run_tools(
         self, messages: list[dict],
         on_status: Callable[[str], None] | None = None,
         after_tool_batch: Callable[[], None] | None = None,
+        on_retry: Callable[..., None] | None = None,
     ) -> tuple[list[dict], bool, bool, str]:
         """Returns messages, has_data, tools_used, direct_reply."""
         has_data = False
@@ -1760,7 +1812,9 @@ class Analyst:
         for round_no in range(1, max_rounds + 1):
             if on_status:
                 on_status("Изучаю запрос")
-            choice = self._request(messages, tools=True).json()["choices"][0]["message"]
+            choice = self._request(
+                messages, tools=True, on_retry=on_retry,
+            ).json()["choices"][0]["message"]
             calls = choice.get("tool_calls") or []
             if not calls:
                 direct = (choice.get("content") or "").strip()
@@ -1816,14 +1870,14 @@ class Analyst:
         )
         return messages, has_data, tools_used, ""
 
-    def _final(self, messages: list[dict]) -> str:
-        response = self._request(messages, stream=False)
+    def _final(self, messages: list[dict], on_retry=None) -> str:
+        response = self._request(messages, stream=False, on_retry=on_retry)
         text = response.json()["choices"][0]["message"].get("content") or ""
         log.info("Final answer stream=False chars=%s", len(text))
         return text
 
     def answer_stream(self, question: str, on_text=None, on_status=None,
-                      history=None, after_tool_batch=None) -> str:
+                      history=None, after_tool_batch=None, on_retry=None) -> str:
         """Compatibility name; final generation is deliberately non-streaming."""
         started = time.monotonic()
         history_len = len(history or [])
@@ -1832,7 +1886,8 @@ class Analyst:
             self.buyer_id, self.buyer_name, history_len, _preview(question),
         )
         messages, has_data, tools_used, direct = self._run_tools(
-            self._messages(question, history), on_status, after_tool_batch
+            self._messages(question, history), on_status, after_tool_batch,
+            on_retry,
         )
         if not has_data:
             if not tools_used:
@@ -1857,7 +1912,8 @@ class Analyst:
             return text
         if on_status:
             on_status("Формулирую ответ")
-        text = (self._final(messages)[:RICH_ANSWER_LIMIT] or "Нет ответа от модели.")
+        text = (self._final(messages, on_retry=on_retry)[:RICH_ANSWER_LIMIT]
+                or "Нет ответа от модели.")
         log.info(
             "Answer done mode=nonstream chars=%s elapsed=%.2fs preview=%r",
             len(text), time.monotonic() - started, _preview(text),

@@ -21,7 +21,7 @@ from telebot import types, util
 from telebot.apihelper import ApiTelegramException
 
 import mysql_stats
-from ai_analysis import Analyst, select_reasoning_effort
+from ai_analysis import Analyst, llm_transient_error, select_reasoning_effort
 from db import (
     bind_group, clear_group_context, count_groups, forget_topic, get_group, init_db,
     list_groups, load_group_context, observed_topics, open_db,
@@ -53,6 +53,8 @@ EMPTY_MENTION_REPLY = (
     "Чем могу помочь? Напишите период и что нужно: "
     "сводка, воронка, креатив или сравнение."
 )
+LLM_FAIL_REPLY = "Ошибка API модели. Попробуйте ещё раз через минуту."
+PROCESS_FAIL_REPLY = "Не получилось обработать запрос. Попробуйте позже."
 T = TypeVar("T")
 _TG_TRANSIENT = (
     requests.exceptions.ConnectionError,
@@ -1073,11 +1075,23 @@ def process_question(request: dict) -> None:
             except Exception:
                 log.debug("Could not publish post-tool status", exc_info=True)
 
+        def on_llm_retry(attempt, retries, status_code=None):
+            if status is None:
+                return
+            tg_call(
+                bot.edit_message_text,
+                f"Ошибка API, повторяю запрос ({attempt}/{retries})…",
+                message.chat.id,
+                status.message_id,
+                attempts=1,
+                skip_if_busy=True,
+            )
+
         # Provider streaming remains enabled internally, but Telegram receives
-        # only the initial status and one final rich edit.
+        # only the initial status, retry notes, and one final rich edit.
         answer = analyst.answer_stream(
             question, on_text=None, on_status=None, history=history,
-            after_tool_batch=after_tool_batch,
+            after_tool_batch=after_tool_batch, on_retry=on_llm_retry,
         )
         done.set()
         with closing(open_db(DATABASE)) as conn:
@@ -1121,11 +1135,17 @@ def process_question(request: dict) -> None:
             message.chat.id, user_id, time.monotonic() - started,
         )
         if telegram_retry_after(failure) is None:
+            fail_text = (
+                LLM_FAIL_REPLY if llm_transient_error(failure) else PROCESS_FAIL_REPLY
+            )
             try:
-                tg_call(
-                    bot.reply_to, message,
-                    "Не получилось обработать запрос. Попробуйте позже.",
-                )
+                if status is not None:
+                    tg_call(
+                        bot.edit_message_text, fail_text,
+                        message.chat.id, status.message_id,
+                    )
+                else:
+                    tg_call(bot.reply_to, message, fail_text)
             except Exception:
                 log.exception("Could not send failure reply chat_id=%s", message.chat.id)
     finally:

@@ -134,6 +134,49 @@ def test_bare_mention_gets_help_reply(monkeypatch):
     assert replies == [bot.EMPTY_MENTION_REPLY]
 
 
+def test_llm_failure_edits_status_instead_of_new_reply(monkeypatch):
+    monkeypatch.setattr(bot, "identity", SimpleNamespace(username="Tg2HtmlBot", id=12))
+    edits = []
+
+    class FakeAnalyst:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def answer_stream(self, *_args, **_kwargs):
+            error = requests.HTTPError("503")
+            error.response = SimpleNamespace(status_code=503, headers={})
+            raise error
+
+    with TemporaryDirectory() as folder:
+        db_path = str(Path(folder) / "bot.sqlite3")
+        monkeypatch.setattr(bot, "DATABASE", db_path)
+        with closing(open_db(db_path)) as conn:
+            init_db(conn)
+            bind_group(conn, -100, "Group", None, "5", "Buyer")
+        monkeypatch.setattr(bot, "Analyst", FakeAnalyst)
+        monkeypatch.setattr(bot, "select_reasoning_effort", lambda *_: None)
+        monkeypatch.setattr(
+            bot.bot, "reply_to",
+            lambda *_args, **_kwargs: SimpleNamespace(message_id=77),
+        )
+        monkeypatch.setattr(
+            bot.bot, "edit_message_text",
+            lambda text, *_args, **_kwargs: edits.append(text),
+        )
+        message = SimpleNamespace(
+            text="кит сколько регистраций за вчера",
+            chat=SimpleNamespace(id=-100, type="supergroup"),
+            from_user=SimpleNamespace(id=7),
+            message_id=50,
+            reply_to_message=None,
+        )
+        bot.process_question({
+            "message": message, "question": "сколько регистраций за вчера",
+            "thread_id": 1,
+        })
+    assert edits == [bot.LLM_FAIL_REPLY]
+
+
 def test_tg_call_retries_connection_errors(monkeypatch):
     monkeypatch.setattr(bot.time, "sleep", lambda *_: None)
     calls = {"n": 0}
@@ -706,7 +749,7 @@ def test_followup_queued_during_answer_gets_previous_answer_in_context(monkeypat
             pass
 
         def answer_stream(self, question, on_text, on_status, history,
-                          after_tool_batch=None):
+                          after_tool_batch=None, on_retry=None):
             contexts.append((question, history))
             if question == "вчера":
                 first_started.set()
