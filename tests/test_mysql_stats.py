@@ -1202,7 +1202,9 @@ def test_telegram_overview_adds_chatter_without_summing(monkeypatch):
     assert result["chatter_report"]["totals"]["chats"] == 27
     assert result["chatter_report"]["totals"]["starts"] == 0
     assert result["chatter_report"]["totals"]["cost_regs"] is None
+    assert result["block_titles"] == {"totals": "Боты", "chatter_report": "Chatter"}
     assert "два блока" in result["note"]
+    assert "Боты" in result["note"]
     funnel_result = model.call_tool(
         "get_funnel", {"date_from": "2026-10-19", "funnel": "new"},
     )
@@ -1234,5 +1236,7 @@ def test_system_prompt_formats_with_chatter_rules():
     text = SYSTEM.format(today="2026-10-20", scope_instruction="тест")
     assert "{today}" not in text
     assert "chatter_report" in text
+    assert "Боты" in text
+    assert "не «Keitaro»" in text
     assert "{tracker.campaign_name}" in text
     assert "{{campaign.name}}" in text

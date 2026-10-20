@@ -376,7 +376,7 @@ def chatter_side_report(conn, buyer_id: str, first: date, last: date) -> dict | 
     report["note"] = (
         "Chatter (traffers_stat): итог байера за день, без креатива. "
         "Строка {tracker.campaign_name} здесь — кабинетный итог, не креатив. "
-        "Не складывай с Keitaro (buyer_stats_today_start_sub). "
+        "Не складывай с блоком Боты (buyer_stats_today_start_sub). "
         "Конверсию и cost_* между таблицами не считай. "
         "Старты у Telegram в этой таблице часто 0; чаты есть только здесь. "
         "Страны из этой таблицы не бери."
