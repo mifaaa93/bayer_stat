@@ -358,6 +358,32 @@ def _buyer_platform(conn, buyer_id: str) -> dict | None:
     }
 
 
+def chatter_side_report(conn, buyer_id: str, first: date, last: date) -> dict | None:
+    """Telegram cabinet totals from Chatter. Facebook already uses traffers_stat."""
+    if not buyer_id or buyer_id == "*":
+        return None
+    if not hasattr(conn, "cursor"):
+        return None
+    buyer = _buyer_platform(conn, buyer_id)
+    if not buyer or buyer["platform"] != "ТГ" or not buyer["name"]:
+        return None
+    report = traffer_report(conn, buyer["name"], first, last)
+    if not report:
+        return None
+    report["label"] = "chatter"
+    report["buyer_id"] = str(buyer_id)
+    report["platform"] = "ТГ"
+    report["note"] = (
+        "Chatter (traffers_stat): итог байера за день, без креатива. "
+        "Строка {tracker.campaign_name} здесь — кабинетный итог, не креатив. "
+        "Не складывай с Keitaro (buyer_stats_today_start_sub). "
+        "Конверсию и cost_* между таблицами не считай. "
+        "Старты у Telegram в этой таблице часто 0; чаты есть только здесь. "
+        "Страны из этой таблицы не бери."
+    )
+    return report
+
+
 def _creative_clause(column: str, creative: str | None, exact: bool,
                      name_token: str | None) -> tuple[str, list]:
     sql = ""

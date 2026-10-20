@@ -816,6 +816,7 @@ def test_overview_does_not_replace_starts_with_a_second_report(monkeypatch):
         "get_overview", {"date_from": "2026-09-29", "funnel": "new"},
     )
     assert "traffer_report" not in result
+    assert "chatter_report" not in result
     assert result["totals"]["starts"] == 38
 
 
@@ -902,7 +903,12 @@ class ReadyCursor:
 
     def fetchall(self):
         if "information_schema" in self.last:
-            return [{"COLUMN_NAME": name} for name in READY[self.params[1]]]
+            if len(self.params) > 1:
+                return [{"COLUMN_NAME": name} for name in READY[self.params[1]]]
+            for table, columns in READY.items():
+                if f"'{table}'" in self.last or f'"{table}"' in self.last:
+                    return [{"COLUMN_NAME": name} for name in columns]
+            return []
         if "FROM `traffers_stat`" in self.last or "FROM `buyer_stats_today_start_sub`" in self.last:
             return [{
                 "stat_date": date(2026, 10, 5), "creative_name": "Ad",
@@ -1065,3 +1071,114 @@ def test_telegram_events_come_from_channel_table(monkeypatch):
     joined = "\n".join(cursor.calls)
     assert "FROM `buyer_stats_today_start_sub`" in joined
     assert "FROM `traffers_stat`" not in joined
+
+
+def test_chatter_side_report_only_for_telegram(monkeypatch):
+    monkeypatch.setenv("MYSQL_DATABASE", "lea_partners_db")
+    fb = type(
+        "Conn", (),
+        {"schema_name": "lea_partners_db", "cursor": lambda self: ReadyCursor("ФБ")},
+    )()
+    assert mysql_stats.chatter_side_report(
+        fb, "1", date(2026, 10, 19), date(2026, 10, 19),
+    ) is None
+    tg = type(
+        "Conn", (),
+        {"schema_name": "lea_partners_db", "cursor": lambda self: ReadyCursor("ТГ")},
+    )()
+    report = mysql_stats.chatter_side_report(
+        tg, "5", date(2026, 10, 19), date(2026, 10, 19),
+    )
+    assert report["label"] == "chatter"
+    assert report["platform"] == "ТГ"
+    assert report["totals"]["regs"] == 1
+    assert report["totals"]["chats"] == 2
+    assert mysql_stats.chatter_side_report(
+        tg, "*", date(2026, 10, 19), date(2026, 10, 19),
+    ) is None
+
+
+def _tg_tool_env(monkeypatch, rows, chatter):
+    class Context:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setenv("MYSQL_DATABASE", "lea_partners_db")
+    monkeypatch.setattr(mysql_stats, "connection", lambda: Context())
+    monkeypatch.setattr(mysql_stats, "buyer", lambda conn, buyer_id: {
+        "id": "5", "name": "NEW_Anastacia", "status": "Работает",
+    })
+    monkeypatch.setattr(mysql_stats, "statistics", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(mysql_stats, "chatter_side_report", lambda *args, **kwargs: chatter)
+    return Analyst("5", "NEW_Anastacia", "key", "model", "https://example.test/v1")
+
+
+CHATTER_SAMPLE = {
+    "source": "traffers_stat",
+    "label": "chatter",
+    "level": "buyer",
+    "buyer_name": "NEW_Anastacia",
+    "days_count": 1,
+    "first_date": "2026-10-19",
+    "last_date": "2026-10-19",
+    "totals": {"starts": 0, "subs": 133, "chats": 27, "regs": 9, "ftd": 0},
+    "days": [{
+        "date": "2026-10-19", "starts": 0, "subs": 133, "chats": 27, "regs": 9, "ftd": 0,
+    }],
+    "truncated": False,
+    "note": "Chatter (traffers_stat): итог байера за день, без креатива.",
+}
+
+
+def test_telegram_overview_adds_chatter_without_summing(monkeypatch):
+    model = _tg_tool_env(monkeypatch, [{
+        "stat_date": "2026-10-19", "creative_name": "Channel", "spend": 0,
+        "spend_missing": False, "starts": 279, "subs": 103, "regs": 0, "ftd": 0,
+        "events_source": "buyer_stats_today_start_sub", "platform": "ТГ",
+    }], CHATTER_SAMPLE)
+    result = model.call_tool(
+        "get_overview", {"date_from": "2026-10-19", "funnel": "new"},
+    )
+    assert result["totals"]["starts"] == 279
+    assert result["totals"]["regs"] == 0
+    assert result["chatter_report"]["totals"]["regs"] == 9
+    assert result["chatter_report"]["totals"]["chats"] == 27
+    assert result["chatter_report"]["totals"]["starts"] == 0
+    assert result["chatter_report"]["totals"]["cost_regs"] is None
+    assert "два блока" in result["note"]
+    funnel_result = model.call_tool(
+        "get_funnel", {"date_from": "2026-10-19", "funnel": "new"},
+    )
+    assert funnel_result["totals"]["starts"] == 279
+    assert funnel_result["chatter_report"]["totals"]["regs"] == 9
+    creative = model.call_tool(
+        "get_creative",
+        {"date_from": "2026-10-19", "creative": "Channel", "funnel": "new"},
+    )
+    assert "chatter_report" not in creative
+    listing = model.call_tool(
+        "list_creatives", {"date_from": "2026-10-19", "funnel": "new"},
+    )
+    assert "chatter_report" not in listing
+
+
+def test_telegram_overview_keeps_chatter_when_keitaro_empty(monkeypatch):
+    model = _tg_tool_env(monkeypatch, [], CHATTER_SAMPLE)
+    result = model.call_tool(
+        "get_overview", {"date_from": "2026-10-09", "funnel": "new"},
+    )
+    assert result["has_data"] is True
+    assert result["rows"] == []
+    assert result["chatter_report"]["totals"]["regs"] == 9
+
+
+def test_system_prompt_formats_with_chatter_rules():
+    from ai_analysis import SYSTEM
+    text = SYSTEM.format(today="2026-10-20", scope_instruction="тест")
+    assert "{today}" not in text
+    assert "chatter_report" in text
+    assert "{tracker.campaign_name}" in text
+    assert "{{campaign.name}}" in text
