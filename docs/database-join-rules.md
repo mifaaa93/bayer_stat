@@ -10,8 +10,8 @@
 
 | Значение | Что считать |
 |---|---|
-| `ФБ` | события из `traffers_stat`, затраты из `creos` |
-| `ТГ` | в ответе два блока: Боты (`buyer_stats_today_start_sub`) по каналам и Chatter (`traffers_stat`) итогом кабинета. Затраты из `creos`. Числа не складываются. |
+| `ФБ` | один блок Chatter: события из `traffers_stat`, затраты из `creos` |
+| `ТГ` | Боты (`buyer_stats_today_start_sub`) — старты и подписки по каналам. Chatter (`traffers_stat`) — только чаты, реги и FTD. Два блока, если спросили чаты/реги/FTD или сводку; только Боты, если спросили старты и подписки. Затраты из `creos`. Числа не складываются. |
 | `ГГЛ` и прочие | постбеки не настроены, бот отдаёт только затраты |
 
 `NEW_Google` и `organic` в справочнике `traffers` нет. Ни к какому байеру они не относятся.
@@ -22,7 +22,7 @@
 
 Facebook: `traffers_stat` и `creos` по дню и точному `creo_name`. Байер находится так: `traffers_stat.traffer_name` → `traffers.id` → `creos.id_traf`, и `platform_name = ФБ`. Для кабинета Farm имя в `traffers_stat` — Pavel.
 
-Telegram: Боты — `buyer_stats_today_start_sub` и `creos` по дню и точному `creo_name`. Байер — `creos.id_traf = traffers.id`, и `platform_name = ТГ`. Chatter — дневной итог `traffers_stat` по `traffer_name`, без склейки с креативом. Страны только из `buyer_stats_today_start_sub_country`.
+Telegram: Боты — `buyer_stats_today_start_sub` и `creos` по дню и точному `creo_name`. Байер — `creos.id_traf = traffers.id`, и `platform_name = ТГ`. Chatter — дневной итог `traffers_stat` по `traffer_name`, без склейки с креативом; в ответе из него только чаты, реги и FTD. Страны только из `buyer_stats_today_start_sub_country`.
 
 Из `creos` берётся только `budget`. Колонки `chats` и `subs` на карточке креатива в расчёт не входят.
 

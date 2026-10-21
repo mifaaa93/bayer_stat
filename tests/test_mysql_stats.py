@@ -8,6 +8,7 @@ import mysql_stats
 from ai_analysis import (
     CLARIFY_QUESTION, Analyst, LLM_RETRY_ATTEMPTS, TOOL_PROGRESS, TOOLS,
     llm_transient_error, parse_date, report_checks, spend_gaps, summarize,
+    tg_show_chatter_block,
 )
 
 
@@ -871,6 +872,7 @@ def test_overview_does_not_replace_starts_with_a_second_report(monkeypatch):
     )
     assert "traffer_report" not in result
     assert "chatter_report" not in result
+    assert result["block_titles"] == {"totals": "Chatter"}
     assert result["totals"]["starts"] == 38
 
 
@@ -1147,6 +1149,9 @@ def test_chatter_side_report_only_for_telegram(monkeypatch):
     assert report["platform"] == "ТГ"
     assert report["totals"]["regs"] == 1
     assert report["totals"]["chats"] == 2
+    assert report["totals"]["ftd"] == 0
+    assert "starts" not in report["totals"]
+    assert "subs" not in report["totals"]
     assert mysql_stats.chatter_side_report(
         tg, "*", date(2026, 10, 19), date(2026, 10, 19),
     ) is None
@@ -1200,7 +1205,8 @@ def test_telegram_overview_adds_chatter_without_summing(monkeypatch):
     assert result["totals"]["regs"] == 0
     assert result["chatter_report"]["totals"]["regs"] == 9
     assert result["chatter_report"]["totals"]["chats"] == 27
-    assert result["chatter_report"]["totals"]["starts"] == 0
+    assert "starts" not in result["chatter_report"]["totals"]
+    assert "subs" not in result["chatter_report"]["totals"]
     assert result["chatter_report"]["totals"]["cost_regs"] is None
     assert result["block_titles"] == {"totals": "Боты", "chatter_report": "Chatter"}
     assert "два блока" in result["note"]
@@ -1219,6 +1225,35 @@ def test_telegram_overview_adds_chatter_without_summing(monkeypatch):
         "list_creatives", {"date_from": "2026-10-19", "funnel": "new"},
     )
     assert "chatter_report" not in listing
+
+
+def test_telegram_starts_question_hides_chatter(monkeypatch):
+    model = _tg_tool_env(monkeypatch, [{
+        "stat_date": "2026-10-19", "creative_name": "Channel", "spend": 0,
+        "spend_missing": False, "starts": 279, "subs": 103, "regs": 0, "ftd": 0,
+        "events_source": "buyer_stats_today_start_sub", "platform": "ТГ",
+    }], CHATTER_SAMPLE)
+    model._question = "сколько стартов и подписок за вчера"
+    result = model.call_tool(
+        "get_overview", {"date_from": "2026-10-19", "funnel": "new"},
+    )
+    assert "chatter_report" not in result
+    assert result["block_titles"] == {"totals": "Боты"}
+    assert result["totals"]["starts"] == 279
+    model._question = "сколько регистраций за вчера"
+    regs = model.call_tool(
+        "get_funnel", {"date_from": "2026-10-19", "funnel": "new"},
+    )
+    assert regs["chatter_report"]["totals"]["regs"] == 9
+
+
+def test_tg_show_chatter_block_by_question():
+    assert tg_show_chatter_block("сколько регистраций за вчера") is True
+    assert tg_show_chatter_block("чаты и фтд") is True
+    assert tg_show_chatter_block("сводка за вчера") is True
+    assert tg_show_chatter_block("сколько стартов за вчера") is False
+    assert tg_show_chatter_block("подписки за неделю") is False
+    assert tg_show_chatter_block("старты и регистрации") is True
 
 
 def test_telegram_overview_keeps_chatter_when_keitaro_empty(monkeypatch):

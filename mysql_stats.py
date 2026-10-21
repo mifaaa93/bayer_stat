@@ -358,6 +358,18 @@ def _buyer_platform(conn, buyer_id: str) -> dict | None:
     }
 
 
+def buyer_platform(conn, buyer_id: str) -> str | None:
+    if not buyer_id or buyer_id == "*":
+        return None
+    if not hasattr(conn, "cursor"):
+        return None
+    try:
+        buyer = _buyer_platform(conn, buyer_id)
+    except Exception:
+        return None
+    return None if not buyer else buyer["platform"]
+
+
 def chatter_side_report(conn, buyer_id: str, first: date, last: date) -> dict | None:
     """Telegram cabinet totals from Chatter. Facebook already uses traffers_stat."""
     if not buyer_id or buyer_id == "*":
@@ -373,13 +385,20 @@ def chatter_side_report(conn, buyer_id: str, first: date, last: date) -> dict | 
     report["label"] = "chatter"
     report["buyer_id"] = str(buyer_id)
     report["platform"] = "ТГ"
+    metrics = ("chats", "regs", "ftd")
+    totals = report.get("totals") or {}
+    report["totals"] = {key: totals.get(key) or 0 for key in metrics}
+    report["metrics"] = list(metrics)
+    report["days"] = [
+        {"date": day["date"], **{key: day.get(key) or 0 for key in metrics}}
+        for day in report.get("days") or []
+    ]
     report["note"] = (
-        "Chatter (traffers_stat): итог байера за день, без креатива. "
-        "Строка {tracker.campaign_name} здесь — кабинетный итог, не креатив. "
+        "Chatter (traffers_stat): только чаты, регистрации и FTD. "
+        "Старты и подписки здесь неактуальны — их бери из блока Боты. "
+        "Строка {tracker.campaign_name} — кабинетный итог, не креатив. "
         "Не складывай с блоком Боты (buyer_stats_today_start_sub). "
-        "Конверсию и cost_* между таблицами не считай. "
-        "Старты у Telegram в этой таблице часто 0; чаты есть только здесь. "
-        "Страны из этой таблицы не бери."
+        "Конверсию между таблицами не считай. Страны из этой таблицы не бери."
     )
     return report
 
