@@ -1202,21 +1202,21 @@ def test_telegram_overview_adds_chatter_without_summing(monkeypatch):
         "get_overview", {"date_from": "2026-10-19", "funnel": "new"},
     )
     assert result["totals"]["starts"] == 279
-    assert result["totals"]["regs"] == 0
+    assert "regs" not in result["totals"]
+    assert "ftd" not in result["totals"]
     assert result["chatter_report"]["totals"]["regs"] == 9
     assert result["chatter_report"]["totals"]["chats"] == 27
     assert "starts" not in result["chatter_report"]["totals"]
     assert "subs" not in result["chatter_report"]["totals"]
     assert result["chatter_report"]["totals"]["cost_regs"] is None
     assert result["block_titles"] == {"totals": "Боты", "chatter_report": "Chatter"}
-    assert result["metric_labels"]["totals"]["regs"] == "Регистрации (когортно)"
-    assert result["metric_labels"]["chatter_report"]["regs"] == "Регистрации"
-    assert "два блока" in result["note"]
+    assert "metric_labels" not in result
     assert "Боты" in result["note"]
     funnel_result = model.call_tool(
         "get_funnel", {"date_from": "2026-10-19", "funnel": "new"},
     )
     assert funnel_result["totals"]["starts"] == 279
+    assert "regs" not in funnel_result["totals"]
     assert funnel_result["chatter_report"]["totals"]["regs"] == 9
     creative = model.call_tool(
         "get_creative",
@@ -1274,7 +1274,7 @@ def test_system_prompt_formats_with_chatter_rules():
     assert "{today}" not in text
     assert "chatter_report" in text
     assert "Боты" in text
-    assert "Регистрации (когортно)" in text
+    assert "когортно" not in text
     assert "не «Keitaro»" in text
     assert "{tracker.campaign_name}" in text
     assert "{{campaign.name}}" in text

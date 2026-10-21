@@ -22,7 +22,7 @@
 
 Facebook: `traffers_stat` и `creos` по дню и точному `creo_name`. Байер находится так: `traffers_stat.traffer_name` → `traffers.id` → `creos.id_traf`, и `platform_name = ФБ`. Для кабинета Farm имя в `traffers_stat` — Pavel.
 
-Telegram: Боты — `buyer_stats_today_start_sub` и `creos` по дню и точному `creo_name`. Байер — `creos.id_traf = traffers.id`, и `platform_name = ТГ`. Реги в блоке Боты когортные: это регистрации людей, которые зашли в бота с канала, поэтому в ответе поле подписывается «Регистрации (когортно)». Chatter — дневной итог `traffers_stat` по `traffer_name`, без склейки с креативом; в ответе из него только чаты, реги и FTD, без пометки «когортно». Страны только из `buyer_stats_today_start_sub_country`.
+Telegram: Боты — `buyer_stats_today_start_sub` и `creos` по дню и точному `creo_name`. Байер — `creos.id_traf = traffers.id`, и `platform_name = ТГ`. В блоке Боты в ответе только старты и подписки. Chatter — дневной итог `traffers_stat` по `traffer_name`, без склейки с креативом; в ответе из него только чаты, реги и FTD. Страны только из `buyer_stats_today_start_sub_country`.
 
 Из `creos` берётся только `budget`. Колонки `chats` и `subs` на карточке креатива в расчёт не входят.
 
